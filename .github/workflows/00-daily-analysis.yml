@@ -354,10 +354,12 @@ jobs:
           SERPAPI_API_KEYS: ${{ secrets.SERPAPI_API_KEYS }}
           MINIMAX_API_KEYS: ${{ secrets.MINIMAX_API_KEYS }}
           BRAVE_API_KEYS: ${{ secrets.BRAVE_API_KEYS }}
-          # 实验分支：指向 runner 内的本地 SearXNG，并关闭公共实例回退，
-          # 以便干净地观测本地实例的真实召回能力（不依赖仓库级 Variables，避免影响 main）。
-          SEARXNG_BASE_URLS: http://localhost:8080
-          SEARXNG_PUBLIC_INSTANCES_ENABLED: 'false'
+          # 本地 SearXNG（见上方「启动本地 SearXNG」步骤）通过 Variables 配置：
+          #   SEARXNG_BASE_URLS=http://localhost:8080
+          #   SEARXNG_PUBLIC_INSTANCES_ENABLED=false
+          # 留空则回退为上游默认行为（公共实例自动发现）。
+          SEARXNG_BASE_URLS: ${{ vars.SEARXNG_BASE_URLS || secrets.SEARXNG_BASE_URLS }}
+          SEARXNG_PUBLIC_INSTANCES_ENABLED: ${{ vars.SEARXNG_PUBLIC_INSTANCES_ENABLED || secrets.SEARXNG_PUBLIC_INSTANCES_ENABLED }}
           
           # ==========================================
           # 通知渠道（可同时配置多个，全部推送）
