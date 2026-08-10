@@ -363,6 +363,11 @@ jobs:
           # 信任 SearXNG 请求侧的 time_range 过滤，保留无 publishedDate 的结果。
           # 默认关闭；开启后 strict_freshness 维度的时效为「大致在窗口内」而非精确保证。
           SEARXNG_TRUST_TIME_RANGE: ${{ vars.SEARXNG_TRUST_TIME_RANGE || secrets.SEARXNG_TRUST_TIME_RANGE }}
+          # 新闻时效窗口。有效窗口 = min(NEWS_MAX_AGE_DAYS, profile 天数)，
+          # profile: ultra_short=1 / short=3 / medium=7 / long=30，留空时为 short + 3 天。
+          # 与 SearXNG 的 time_range=week 对齐时建议 medium + 7。
+          NEWS_STRATEGY_PROFILE: ${{ vars.NEWS_STRATEGY_PROFILE || secrets.NEWS_STRATEGY_PROFILE }}
+          NEWS_MAX_AGE_DAYS: ${{ vars.NEWS_MAX_AGE_DAYS || secrets.NEWS_MAX_AGE_DAYS }}
           
           # ==========================================
           # 通知渠道（可同时配置多个，全部推送）
