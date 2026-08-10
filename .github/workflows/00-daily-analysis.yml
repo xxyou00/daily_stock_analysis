@@ -360,6 +360,9 @@ jobs:
           # 留空则回退为上游默认行为（公共实例自动发现）。
           SEARXNG_BASE_URLS: ${{ vars.SEARXNG_BASE_URLS || secrets.SEARXNG_BASE_URLS }}
           SEARXNG_PUBLIC_INSTANCES_ENABLED: ${{ vars.SEARXNG_PUBLIC_INSTANCES_ENABLED || secrets.SEARXNG_PUBLIC_INSTANCES_ENABLED }}
+          # 信任 SearXNG 请求侧的 time_range 过滤，保留无 publishedDate 的结果。
+          # 默认关闭；开启后 strict_freshness 维度的时效为「大致在窗口内」而非精确保证。
+          SEARXNG_TRUST_TIME_RANGE: ${{ vars.SEARXNG_TRUST_TIME_RANGE || secrets.SEARXNG_TRUST_TIME_RANGE }}
           
           # ==========================================
           # 通知渠道（可同时配置多个，全部推送）
