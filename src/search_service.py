@@ -13,6 +13,7 @@ A股自选股智能分析系统 - 搜索服务模块
 
 import logging
 import multiprocessing
+import os
 import re
 import threading
 import time
@@ -37,6 +38,7 @@ from data_provider.us_index_mapping import is_us_index_code
 from src.config import (
     NEWS_STRATEGY_WINDOWS,
     normalize_news_strategy_profile,
+    parse_env_bool,
     resolve_news_window_days,
 )
 from src.data.stock_mapping import (
@@ -3659,6 +3661,25 @@ class SearchService:
 
         return None
 
+    @staticmethod
+    def _provider_prefilters_freshness(provider: "BaseSearchProvider") -> bool:
+        """判断该 provider 是否已在请求侧完成时效过滤，可豁免客户端的 published_date 硬校验。
+
+        背景：SearXNG 请求时已带 ``time_range``（见 SearXNGSearchProvider._time_range），
+        但其 JSON 结果普遍不含 ``publishedDate``。对 strict_freshness 维度再做一次
+        published_date 硬过滤，会把整批结果判为 drop_unknown 而全部丢弃，
+        导致「最新消息 / 公司公告 / 风险排查」恒为 0 条。
+
+        兼容性：默认关闭，行为与上游一致；仅当显式设置
+        ``SEARXNG_TRUST_TIME_RANGE=true`` 时对 SearXNG 生效，其他 provider 不受影响。
+
+        注意：``time_range`` 粒度只有 day/week/month/year，且部分上游引擎会忽略该参数，
+        因此开启后进入分析的新闻时效为「大致在窗口内」，不是精确保证。
+        """
+        if not isinstance(provider, SearXNGSearchProvider):
+            return False
+        return parse_env_bool(os.getenv('SEARXNG_TRUST_TIME_RANGE'), default=False)
+
     def _filter_news_response(
         self,
         response: SearchResponse,
@@ -4552,6 +4573,7 @@ class SearchService:
                     response,
                     search_days=search_days,
                     max_results=provider_max_results,
+                    keep_unknown=self._provider_prefilters_freshness(provider),
                     log_scope=f"{stock_code}:{provider.name}:{dim['name']}",
                 )
             elif dim['name'] in self.ANALYTICAL_INTEL_DIMENSIONS:
