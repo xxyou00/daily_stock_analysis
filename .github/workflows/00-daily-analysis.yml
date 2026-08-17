@@ -1,9 +1,10 @@
 name: 每日股票分析
 
 on:
-  # 定时触发 - 每天北京时间 18:00 (UTC 10:00)
+  # 定时触发 - 每天北京时间 17:18 (UTC 09:18)
+  # 刻意避开整点：GitHub Actions 在 :00 有大量排队，schedule 触发会被延迟数分钟到数十分钟。
   schedule:
-    - cron: '0 10 * * 1-5'     # 周一到周五，UTC 10:00 = 北京时间 18:00
+    - cron: '18 9 * * 1-5'     # 周一到周五，UTC 09:18 = 北京时间 17:18
   
   # 手动触发
   workflow_dispatch:
@@ -59,7 +60,91 @@ jobs:
       - name: 创建必要目录
         run: |
           mkdir -p data logs reports
-      
+
+      # 实验：在 runner 内启动本地 SearXNG，避免公共实例共享 IP 限流。
+      # 只影响搜索来源，不改变 LLM / provider / 通知任何语义；容器起不来时 fail-open 继续跑。
+      - name: 启动本地 SearXNG
+        run: |
+          set -x
+          mkdir -p /tmp/searxng
+          # heredoc 内容带 YAML 块缩进，写入后用 sed 去掉统一前缀，
+          # 否则 settings.yml 顶层键带缩进会被 SearXNG 判为无效配置。
+          cat > /tmp/searxng/settings.raw <<'SETTINGS_EOF'
+          use_default_settings: true
+          server:
+            secret_key: "dsa-local-searxng-ci"
+            limiter: false
+            image_proxy: false
+          search:
+            safe_search: 0
+            default_lang: "zh-CN"
+            formats:
+              - html
+              - json
+          SETTINGS_EOF
+          sed 's/^          //' /tmp/searxng/settings.raw > /tmp/searxng/settings.yml
+          echo "--- 生成的 settings.yml ---"
+          cat /tmp/searxng/settings.yml
+          python3 -c "import yaml,sys;yaml.safe_load(open('/tmp/searxng/settings.yml'));print('✅ settings.yml YAML 合法')"
+          docker run -d --name searxng \
+            -p 8080:8080 \
+            -v /tmp/searxng/settings.yml:/etc/searxng/settings.yml:ro \
+            -e SEARXNG_SECRET=dsa-local-searxng-ci \
+            searxng/searxng:latest
+          echo "等待 SearXNG JSON 接口就绪..."
+          for i in $(seq 1 40); do
+            if curl -sf --max-time 5 "http://localhost:8080/search?q=test&format=json" -o /tmp/searxng_probe.json; then
+              echo "✅ SearXNG JSON 接口就绪（第 ${i} 次探测）"
+              break
+            fi
+            sleep 3
+          done
+          echo "--- 容器日志（末尾 30 行）---"
+          docker logs --tail 30 searxng || true
+          echo "--- 中文搜索连通性自检 ---"
+          curl -sf --max-time 25 "http://localhost:8080/search?q=%E5%90%8C%E8%8A%B1%E9%A1%BA&format=json&language=zh-CN" \
+            -o /tmp/searxng_zh.json && \
+            python3 -c "import json;d=json.load(open('/tmp/searxng_zh.json'));r=d.get('results',[]);print('结果数:',len(r));[print(' -',x.get('title','')[:70]) for x in r[:5]]" \
+            || echo '⚠️ 中文搜索自检失败，后续分析将 fail-open 继续'
+        continue-on-error: true
+
+      # 在 runner 内启动本地 RSSHub，给本地资讯池（IntelligenceService）供中文财经 RSS。
+      # 思路与上面的 SearXNG 一致：公共实例对数据中心共享 IP 限流严重，自建更稳。
+      # RSS 条目自带 pubDate，能通过严格时效过滤，正好补 SearXNG 结果无日期的短板。
+      # 容器起不来或上游拒绝抓取时 fail-open，资讯池为空不影响其余分析环节。
+      - name: 启动本地 RSSHub
+        run: |
+          set -x
+          docker run -d --name rsshub \
+            -p 1200:1200 \
+            -e NODE_ENV=production \
+            -e CACHE_TYPE=memory \
+            diygod/rsshub:latest
+          echo "等待 RSSHub 健康检查就绪..."
+          for i in $(seq 1 40); do
+            if curl -sf --max-time 5 "http://localhost:1200/healthz" -o /dev/null; then
+              echo "✅ RSSHub 就绪（第 ${i} 次探测）"
+              break
+            fi
+            sleep 3
+          done
+          echo "--- 容器日志（末尾 30 行）---"
+          docker logs --tail 30 rsshub || true
+          # 自检是本步骤的判决点：容器起来不代表上游放行。财联社等站点可能拒绝
+          # 数据中心 IP，那种情况下这里会显示 items=0 或请求失败。
+          echo "--- 财经路由连通性自检 ---"
+          for ROUTE in "/cls/telegraph?limit=3" "/cls/hot?limit=3" "/10jqka/realtimenews?limit=3" "/jin10/1?limit=3" "/gelonghui/live?limit=3"; do
+            printf '%-34s ' "$ROUTE"
+            if curl -sf --max-time 40 "http://localhost:1200${ROUTE}" -o /tmp/rsshub_probe.xml 2>/dev/null; then
+              ITEMS=$(grep -o "<item>" /tmp/rsshub_probe.xml | wc -l | tr -d ' ')
+              FIRST=$(python3 -c "import xml.etree.ElementTree as ET;t=ET.parse('/tmp/rsshub_probe.xml').getroot().findall('.//item/title');print(((t[0].text or '').strip())[:52] if t else '(无条目)')" 2>/dev/null || echo '(解析失败)')
+              echo "items=${ITEMS} | 首条: ${FIRST}"
+            else
+              echo "❌ 请求失败（上游可能拒绝数据中心 IP）"
+            fi
+          done
+        continue-on-error: true
+
       - name: 执行股票分析
         env:
           # ==========================================
@@ -307,8 +392,35 @@ jobs:
           SERPAPI_API_KEYS: ${{ secrets.SERPAPI_API_KEYS }}
           MINIMAX_API_KEYS: ${{ secrets.MINIMAX_API_KEYS }}
           BRAVE_API_KEYS: ${{ secrets.BRAVE_API_KEYS }}
+          # 本地 SearXNG（见上方「启动本地 SearXNG」步骤）通过 Variables 配置：
+          #   SEARXNG_BASE_URLS=http://localhost:8080
+          #   SEARXNG_PUBLIC_INSTANCES_ENABLED=false
+          # 留空则回退为上游默认行为（公共实例自动发现）。
           SEARXNG_BASE_URLS: ${{ vars.SEARXNG_BASE_URLS || secrets.SEARXNG_BASE_URLS }}
           SEARXNG_PUBLIC_INSTANCES_ENABLED: ${{ vars.SEARXNG_PUBLIC_INSTANCES_ENABLED || secrets.SEARXNG_PUBLIC_INSTANCES_ENABLED }}
+          # 信任 SearXNG 请求侧的 time_range 过滤，保留无 publishedDate 的结果。
+          # 默认关闭；开启后 strict_freshness 维度的时效为「大致在窗口内」而非精确保证。
+          SEARXNG_TRUST_TIME_RANGE: ${{ vars.SEARXNG_TRUST_TIME_RANGE || secrets.SEARXNG_TRUST_TIME_RANGE }}
+          # 新闻时效窗口。有效窗口 = min(NEWS_MAX_AGE_DAYS, profile 天数)，
+          # profile: ultra_short=1 / short=3 / medium=7 / long=30，留空时为 short + 3 天。
+          # 与 SearXNG 的 time_range=week 对齐时建议 medium + 7。
+          NEWS_STRATEGY_PROFILE: ${{ vars.NEWS_STRATEGY_PROFILE || secrets.NEWS_STRATEGY_PROFILE }}
+          NEWS_MAX_AGE_DAYS: ${{ vars.NEWS_MAX_AGE_DAYS || secrets.NEWS_MAX_AGE_DAYS }}
+          # ==========================================
+          # 本地资讯池（IntelligenceService）
+          # 搜索引擎是「搜到什么算什么」，资讯池是固定源的时间序列，
+          # 且条目自带发布时间，能通过严格时效过滤。两者互补。
+          # ==========================================
+          # 总开关。为 false（默认）时下面几项都不起作用，既不拉取也不注册源。
+          NEWS_INTEL_AUTO_FETCH_ENABLED: ${{ vars.NEWS_INTEL_AUTO_FETCH_ENABLED || secrets.NEWS_INTEL_AUTO_FETCH_ENABLED }}
+          NEWS_INTEL_RETENTION_DAYS: ${{ vars.NEWS_INTEL_RETENTION_DAYS || secrets.NEWS_INTEL_RETENTION_DAYS }}
+          NEWS_INTEL_FETCH_TIMEOUT_SEC: ${{ vars.NEWS_INTEL_FETCH_TIMEOUT_SEC || secrets.NEWS_INTEL_FETCH_TIMEOUT_SEC }}
+          NEWS_INTEL_MAX_ITEMS_PER_SOURCE: ${{ vars.NEWS_INTEL_MAX_ITEMS_PER_SOURCE || secrets.NEWS_INTEL_MAX_ITEMS_PER_SOURCE }}
+          # 自建 RSSHub 地址，指向上面 runner 内启动的容器。留空则不注册任何
+          # RSSHub 源（等同上游行为），要回退直接删掉这个 Variable 即可。
+          RSSHUB_BASE_URL: ${{ vars.RSSHUB_BASE_URL || secrets.RSSHUB_BASE_URL }}
+          # NewsNow 实例地址。默认公共实例已被 Cloudflare 拦（403），有自建再填。
+          NEWSNOW_BASE_URL: ${{ vars.NEWSNOW_BASE_URL || secrets.NEWSNOW_BASE_URL }}
           
           # ==========================================
           # 通知渠道（可同时配置多个，全部推送）
@@ -421,6 +533,22 @@ jobs:
           MAX_WORKERS: ${{ vars.MAX_WORKERS || secrets.MAX_WORKERS || '1' }}
           # 筹码分布：默认 false（云端接口不稳定）；需启用时在 Settings → Variables 添加 ENABLE_CHIP_DISTRIBUTION=true
           ENABLE_CHIP_DISTRIBUTION: ${{ vars.ENABLE_CHIP_DISTRIBUTION || secrets.ENABLE_CHIP_DISTRIBUTION || 'false' }}
+          # 筹码接口同源重试次数（默认 1 = 不重试，保持上游行为；建议 3）
+          CHIP_DISTRIBUTION_RETRY_MAX: ${{ vars.CHIP_DISTRIBUTION_RETRY_MAX || secrets.CHIP_DISTRIBUTION_RETRY_MAX }}
+          # 外部筹码源全部失败后，用日线本地估算兜底（默认 false）。
+          # 结果 source=local_estimate，属估算值而非东财官方数据，请在解读时区分。
+          CHIP_LOCAL_ESTIMATE_ENABLED: ${{ vars.CHIP_LOCAL_ESTIMATE_ENABLED || secrets.CHIP_LOCAL_ESTIMATE_ENABLED }}
+          CHIP_LOCAL_ESTIMATE_LOOKBACK: ${{ vars.CHIP_LOCAL_ESTIMATE_LOOKBACK || secrets.CHIP_LOCAL_ESTIMATE_LOOKBACK }}
+          # 基本面聚合超时预算。stage 为整个基本面阶段的总预算，会被实时行情调用先消耗一部分；
+          # 默认 8s 在 Actions 上常不足以完成后续 AkShare 财报调用（表现为财报字段全 N/A）。
+          # 留空即保持上游默认 8.0，不改变现有行为。
+          FUNDAMENTAL_STAGE_TIMEOUT_SECONDS: ${{ vars.FUNDAMENTAL_STAGE_TIMEOUT_SECONDS || secrets.FUNDAMENTAL_STAGE_TIMEOUT_SECONDS }}
+          FUNDAMENTAL_FETCH_TIMEOUT_SECONDS: ${{ vars.FUNDAMENTAL_FETCH_TIMEOUT_SECONDS || secrets.FUNDAMENTAL_FETCH_TIMEOUT_SECONDS }}
+          # 东财接口补丁：注入 NID 令牌与随机 User-Agent，降低 RemoteDisconnected 概率。默认 false。
+          ENABLE_EASTMONEY_PATCH: ${{ vars.ENABLE_EASTMONEY_PATCH || secrets.ENABLE_EASTMONEY_PATCH }}
+          # 盘中实时技术指标：true 时用实时价计算 MA，会把技术块标记为 partial（intraday_realtime_overlay）；
+          # 设为 false 则用昨日收盘计算，技术块变 available，但失去盘中实时性。留空保持上游默认 true。
+          ENABLE_REALTIME_TECHNICAL_INDICATORS: ${{ vars.ENABLE_REALTIME_TECHNICAL_INDICATORS || secrets.ENABLE_REALTIME_TECHNICAL_INDICATORS }}
           # 实时行情数据源优先级（腾讯有量比且稳定，推荐首选）
           # 可选值: tencent, akshare_sina, efinance, akshare_em, tickflow, tushare
           # 如果有 TickFlow 或 Tushare Pro，可按权限把 tickflow / tushare 放在更靠前位置
