@@ -1,0 +1,220 @@
+name: 美股复盘与A股关联推荐
+
+# 美股收盘后运行，与每日 A 股分析（00-daily-analysis.yml）完全独立：
+# 区域通过脚本内的 override_region="us" 传入，不依赖也不修改 MARKET_REVIEW_REGION，
+# 因此不会影响 17:18 的 A 股任务。
+on:
+  schedule:
+    # UTC 21:30 = 北京时间次日 05:30。
+    # 美股收盘为 EDT 夏令时 20:00 UTC / EST 冬令时 21:00 UTC，21:30 可覆盖两种时制；
+    # 同时早于 A 股 09:30 开盘，推荐结果当天可用。非整点亦为避开 Actions 排队高峰。
+    - cron: '30 21 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      picks:
+        description: 'A股推荐数量'
+        required: false
+        default: '10'
+        type: string
+      dry_run:
+        description: '只生成不推送'
+        required: false
+        default: false
+        type: boolean
+      force_run:
+        description: '跳过美股交易日检查'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  # 与 A 股任务使用不同的 group，避免两个任务互相排队
+  group: us-market-cn-picks
+  cancel-in-progress: false
+
+jobs:
+  us-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(vars.US_PICKS_TIMEOUT_MINUTES || '25') }}
+    steps:
+      - name: 随机延迟（避免固定时间访问）
+        run: sleep $((RANDOM % 60))
+
+      - name: 检出代码
+        uses: actions/checkout@v5
+
+      - name: 设置 Python 环境
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 安装依赖
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 创建必要目录
+        run: mkdir -p data logs reports
+
+      # 与 A 股任务一致：runner 内自建 SearXNG，规避公共实例共享 IP 限流
+      - name: 启动本地 SearXNG
+        run: |
+          set -x
+          mkdir -p /tmp/searxng
+          cat > /tmp/searxng/settings.raw <<'SETTINGS_EOF'
+          use_default_settings: true
+          server:
+            secret_key: "dsa-local-searxng-ci"
+            limiter: false
+            image_proxy: false
+          search:
+            safe_search: 0
+            default_lang: "zh-CN"
+            formats:
+              - html
+              - json
+          SETTINGS_EOF
+          sed 's/^          //' /tmp/searxng/settings.raw > /tmp/searxng/settings.yml
+          docker run -d --name searxng \
+            -p 8080:8080 \
+            -v /tmp/searxng/settings.yml:/etc/searxng/settings.yml:ro \
+            -e SEARXNG_SECRET=dsa-local-searxng-ci \
+            searxng/searxng:latest
+          for i in $(seq 1 40); do
+            if curl -sf --max-time 5 "http://localhost:8080/search?q=test&format=json" -o /dev/null; then
+              echo "✅ SearXNG JSON 接口就绪（第 ${i} 次探测）"
+              break
+            fi
+            sleep 3
+          done
+          docker logs --tail 20 searxng || true
+        continue-on-error: true
+
+      # 与 A 股任务一致：runner 内自建 RSSHub，给本地资讯池供带发布时间的财经 RSS。
+      # 「消息催化」缺内容的根因是 SearXNG 结果没有 publishedDate 会被时效过滤丢弃，
+      # RSS 自带 pubDate 正好补这一层。抓不到时 fail-open，不影响复盘其余部分。
+      - name: 启动本地 RSSHub
+        run: |
+          set -x
+          docker run -d --name rsshub \
+            -p 1200:1200 \
+            -e NODE_ENV=production \
+            -e CACHE_TYPE=memory \
+            diygod/rsshub:latest
+          echo "等待 RSSHub 健康检查就绪..."
+          for i in $(seq 1 40); do
+            if curl -sf --max-time 5 "http://localhost:1200/healthz" -o /dev/null; then
+              echo "✅ RSSHub 就绪（第 ${i} 次探测）"
+              break
+            fi
+            sleep 3
+          done
+          docker logs --tail 20 rsshub || true
+          echo "--- 财经路由连通性自检 ---"
+          for ROUTE in "/jin10/1?limit=3" "/cls/telegraph?limit=3" "/gelonghui/live?limit=3"; do
+            printf '%-30s ' "$ROUTE"
+            if curl -sf --max-time 40 "http://localhost:1200${ROUTE}" -o /tmp/rsshub_probe.xml 2>/dev/null; then
+              ITEMS=$(grep -o "<item>" /tmp/rsshub_probe.xml | wc -l | tr -d ' ')
+              FIRST=$(python3 -c "import xml.etree.ElementTree as ET;t=ET.parse('/tmp/rsshub_probe.xml').getroot().findall('.//item/title');print(((t[0].text or '').strip())[:52] if t else '(无条目)')" 2>/dev/null || echo '(解析失败)')
+              echo "items=${ITEMS} | 首条: ${FIRST}"
+            else
+              echo "❌ 请求失败（上游可能拒绝数据中心 IP）"
+            fi
+          done
+        continue-on-error: true
+
+      - name: 美股复盘 + A股关联推荐
+        env:
+          # ===== AI 模型（与 A 股任务共用同一套 Secrets/Variables）=====
+          LITELLM_MODEL: ${{ vars.LITELLM_MODEL || secrets.LITELLM_MODEL }}
+          LITELLM_FALLBACK_MODELS: ${{ vars.LITELLM_FALLBACK_MODELS || secrets.LITELLM_FALLBACK_MODELS }}
+          LLM_TEMPERATURE: ${{ vars.LLM_TEMPERATURE || secrets.LLM_TEMPERATURE }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL || secrets.OPENAI_BASE_URL }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL || secrets.OPENAI_MODEL }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          AIHUBMIX_KEY: ${{ secrets.AIHUBMIX_KEY }}
+          ANSPIRE_API_KEYS: ${{ secrets.ANSPIRE_API_KEYS }}
+
+          # ===== 搜索（美股复盘的情报来源）=====
+          SEARXNG_BASE_URLS: ${{ vars.SEARXNG_BASE_URLS || secrets.SEARXNG_BASE_URLS }}
+          SEARXNG_PUBLIC_INSTANCES_ENABLED: ${{ vars.SEARXNG_PUBLIC_INSTANCES_ENABLED || secrets.SEARXNG_PUBLIC_INSTANCES_ENABLED }}
+          SEARXNG_TRUST_TIME_RANGE: ${{ vars.SEARXNG_TRUST_TIME_RANGE || secrets.SEARXNG_TRUST_TIME_RANGE }}
+          NEWS_STRATEGY_PROFILE: ${{ vars.NEWS_STRATEGY_PROFILE || secrets.NEWS_STRATEGY_PROFILE }}
+          NEWS_MAX_AGE_DAYS: ${{ vars.NEWS_MAX_AGE_DAYS || secrets.NEWS_MAX_AGE_DAYS }}
+          # ===== 本地资讯池（带发布时间，补「消息催化」）=====
+          NEWS_INTEL_AUTO_FETCH_ENABLED: ${{ vars.NEWS_INTEL_AUTO_FETCH_ENABLED || secrets.NEWS_INTEL_AUTO_FETCH_ENABLED }}
+          NEWS_INTEL_RETENTION_DAYS: ${{ vars.NEWS_INTEL_RETENTION_DAYS || secrets.NEWS_INTEL_RETENTION_DAYS }}
+          NEWS_INTEL_FETCH_TIMEOUT_SEC: ${{ vars.NEWS_INTEL_FETCH_TIMEOUT_SEC || secrets.NEWS_INTEL_FETCH_TIMEOUT_SEC }}
+          NEWS_INTEL_MAX_ITEMS_PER_SOURCE: ${{ vars.NEWS_INTEL_MAX_ITEMS_PER_SOURCE || secrets.NEWS_INTEL_MAX_ITEMS_PER_SOURCE }}
+          RSSHUB_BASE_URL: ${{ vars.RSSHUB_BASE_URL || secrets.RSSHUB_BASE_URL }}
+          NEWSNOW_BASE_URL: ${{ vars.NEWSNOW_BASE_URL || secrets.NEWSNOW_BASE_URL }}
+          TAVILY_API_KEYS: ${{ secrets.TAVILY_API_KEYS }}
+          SERPAPI_API_KEYS: ${{ secrets.SERPAPI_API_KEYS }}
+          BOCHA_API_KEYS: ${{ secrets.BOCHA_API_KEYS }}
+          BRAVE_API_KEYS: ${{ secrets.BRAVE_API_KEYS }}
+          MINIMAX_API_KEYS: ${{ secrets.MINIMAX_API_KEYS }}
+
+          # ===== 通知渠道（与 A 股任务共用）=====
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          FEISHU_WEBHOOK_SECRET: ${{ secrets.FEISHU_WEBHOOK_SECRET }}
+          FEISHU_WEBHOOK_KEYWORD: ${{ secrets.FEISHU_WEBHOOK_KEYWORD }}
+          FEISHU_DOMAIN: ${{ vars.FEISHU_DOMAIN || secrets.FEISHU_DOMAIN }}
+          CUSTOM_WEBHOOK_URLS: ${{ secrets.CUSTOM_WEBHOOK_URLS }}
+          CUSTOM_WEBHOOK_BODY_TEMPLATE: ${{ vars.CUSTOM_WEBHOOK_BODY_TEMPLATE || secrets.CUSTOM_WEBHOOK_BODY_TEMPLATE }}
+          CUSTOM_WEBHOOK_BEARER_TOKEN: ${{ secrets.CUSTOM_WEBHOOK_BEARER_TOKEN }}
+          WECHAT_WEBHOOK_URL: ${{ secrets.WECHAT_WEBHOOK_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_RECEIVERS: ${{ secrets.EMAIL_RECEIVERS }}
+
+          # ===== 行情数据源 =====
+          TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+          ALPHAVANTAGE_API_KEY: ${{ secrets.ALPHAVANTAGE_API_KEY }}
+          REALTIME_SOURCE_PRIORITY: ${{ vars.REALTIME_SOURCE_PRIORITY || 'tencent,akshare_sina,efinance,akshare_em' }}
+          ENABLE_EASTMONEY_PATCH: ${{ vars.ENABLE_EASTMONEY_PATCH || secrets.ENABLE_EASTMONEY_PATCH }}
+          YFINANCE_PRIORITY: ${{ vars.YFINANCE_PRIORITY || '0' }}
+
+          # ===== 本任务专属：固定美股区域，不读取 MARKET_REVIEW_REGION =====
+          # 脚本内以 override_region="us" 传入，此处仅作为兜底与自检可见性
+          MARKET_REVIEW_REGION: us
+          MARKET_REVIEW_ENABLED: 'true'
+          REPORT_LANGUAGE: ${{ vars.REPORT_LANGUAGE || 'zh' }}
+
+          # ===== 系统 =====
+          DATABASE_PATH: ./data/stock_analysis.db
+          LOG_DIR: ./logs
+          LOG_LEVEL: INFO
+          DEBUG: 'true'
+          TZ: Asia/Shanghai
+        run: |
+          echo "===== 美股复盘 + A股关联推荐 ====="
+          echo "推荐数量: ${{ inputs.picks || '10' }}"
+          echo "dry-run: ${{ inputs.dry_run || 'false' }}"
+          echo "LLM 模型: ${LITELLM_MODEL:-未配置}"
+          echo "通知渠道: 飞书=$([ -n "$FEISHU_WEBHOOK_URL" ] && echo 已配置 || echo 未配置)，自定义Webhook=$([ -n "$CUSTOM_WEBHOOK_URLS" ] && echo 已配置 || echo 未配置)"
+          ARGS="--picks ${{ inputs.picks || '10' }}"
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+          if [ "${{ inputs.force_run }}" = "true" ]; then
+            ARGS="$ARGS --force-run"
+          fi
+          python scripts/us_market_cn_picks.py $ARGS
+
+      - name: 上传日志与报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: us-market-cn-picks-${{ github.run_number }}
+          path: |
+            logs/
+            reports/
+          retention-days: 7
+          if-no-files-found: ignore
