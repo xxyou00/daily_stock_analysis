@@ -2167,34 +2167,55 @@ class DataFetcherManager:
 
             candidate_fetchers.append((fetcher, fetcher_name, source_key))
 
+        # 同一数据源的重试次数。筹码接口（尤其东财 stock_cyq_em）常见瞬时
+        # RemoteDisconnected / 空结果，单次调用失败率偏高。
+        # 默认 1 表示只尝试一次，与上游行为一致；设为 3 时按退避重试同一数据源。
+        # 仅最后一次失败才写入熔断器，避免重试把熔断器过早打开、连带后续标的被跳过。
+        import os as _os
+        from src.config import parse_env_int
+        chip_retry_max = max(
+            1,
+            parse_env_int(
+                _os.getenv('CHIP_DISTRIBUTION_RETRY_MAX'),
+                1,
+                field_name='CHIP_DISTRIBUTION_RETRY_MAX',
+                minimum=1,
+            ),
+        )
+
         for index, (fetcher, fetcher_name, source_key) in enumerate(candidate_fetchers):
             fallback_to = (
                 candidate_fetchers[index + 1][1]
                 if index + 1 < len(candidate_fetchers)
                 else None
             )
-            attempt_start = time.time()
-            try:
-                record_provider_run_started(
-                    data_type="chip",
-                    provider=fetcher_name,
-                    operation="get_chip_distribution",
-                )
-                chip = self._call_fetcher_method(fetcher, 'get_chip_distribution', stock_code)
-                latency_ms = int((time.time() - attempt_start) * 1000)
-                if _is_meaningful_chip_distribution(chip):
-                    record_provider_run(
+            for attempt in range(chip_retry_max):
+                is_last_attempt = attempt + 1 >= chip_retry_max
+                attempt_start = time.time()
+                try:
+                    record_provider_run_started(
                         data_type="chip",
                         provider=fetcher_name,
                         operation="get_chip_distribution",
-                        success=True,
-                        latency_ms=latency_ms,
-                        record_count=1,
                     )
-                    circuit_breaker.record_success(source_key)
-                    logger.info(f"[筹码分布] {stock_code} 成功获取 (来源: {fetcher_name})")
-                    return chip
-                else:
+                    chip = self._call_fetcher_method(fetcher, 'get_chip_distribution', stock_code)
+                    latency_ms = int((time.time() - attempt_start) * 1000)
+                    if _is_meaningful_chip_distribution(chip):
+                        record_provider_run(
+                            data_type="chip",
+                            provider=fetcher_name,
+                            operation="get_chip_distribution",
+                            success=True,
+                            latency_ms=latency_ms,
+                            record_count=1,
+                        )
+                        circuit_breaker.record_success(source_key)
+                        logger.info(
+                            f"[筹码分布] {stock_code} 成功获取 (来源: {fetcher_name}"
+                            f"{'' if attempt == 0 else f'，第 {attempt + 1} 次尝试'})"
+                        )
+                        return chip
+
                     record_provider_run(
                         data_type="chip",
                         provider=fetcher_name,
@@ -2203,34 +2224,163 @@ class DataFetcherManager:
                         latency_ms=latency_ms,
                         error_type="empty",
                         error_message="empty or incomplete chip distribution",
-                        fallback_to=fallback_to,
+                        fallback_to=fallback_to if is_last_attempt else fetcher_name,
                         record_count=0,
                     )
                     if chip is not None:
                         logger.warning(
-                            "[筹码分布] %s 返回字段不完整或占位值，继续尝试下一个数据源",
+                            "[筹码分布] %s 返回字段不完整或占位值（尝试 %s/%s）",
                             fetcher_name,
+                            attempt + 1,
+                            chip_retry_max,
                         )
+                    if not is_last_attempt:
+                        self._sleep_chip_retry(attempt)
+                        continue
                     # 空结果或占位结果：释放 HALF_OPEN 探测名额，避免卡死
                     circuit_breaker.record_inconclusive(source_key)
-            except Exception as e:
-                error_type, error_reason = summarize_exception(e)
-                record_provider_run(
-                    data_type="chip",
-                    provider=fetcher_name,
-                    operation="get_chip_distribution",
-                    success=False,
-                    latency_ms=int((time.time() - attempt_start) * 1000),
-                    error_type=error_type,
-                    error_message=error_reason,
-                    fallback_to=fallback_to,
-                )
-                logger.warning(f"[筹码分布] {fetcher_name} 获取 {stock_code} 失败: {e}")
-                circuit_breaker.record_failure(source_key, str(e))
-                continue
+                except Exception as e:
+                    error_type, error_reason = summarize_exception(e)
+                    record_provider_run(
+                        data_type="chip",
+                        provider=fetcher_name,
+                        operation="get_chip_distribution",
+                        success=False,
+                        latency_ms=int((time.time() - attempt_start) * 1000),
+                        error_type=error_type,
+                        error_message=error_reason,
+                        fallback_to=fallback_to if is_last_attempt else fetcher_name,
+                    )
+                    logger.warning(
+                        f"[筹码分布] {fetcher_name} 获取 {stock_code} 失败"
+                        f"（尝试 {attempt + 1}/{chip_retry_max}）: {e}"
+                    )
+                    if not is_last_attempt:
+                        self._sleep_chip_retry(attempt)
+                        continue
+                    circuit_breaker.record_failure(source_key, str(e))
+                break
+
+        # 外部筹码源全部失败后的最后兜底：用日线本地估算（默认关闭）
+        estimated = self._estimate_chip_distribution_locally(stock_code)
+        if _is_meaningful_chip_distribution(estimated):
+            return estimated
 
         logger.warning(f"[筹码分布] {stock_code} 所有数据源均失败")
         return None
+
+    def _estimate_chip_distribution_locally(self, stock_code: str):
+        """所有外部筹码源失败后，用日线 + 流通股本本地估算筹码分布。
+
+        东财 stock_cyq_em 是筹码分布的唯一外部来源（AkShare 无备选接口），
+        在云端环境失败率很高。筹码分布本身是日线的派生指标，因此可以本地推导。
+
+        结果 source 为 ``local_estimate``，与真实接口数据可区分；
+        默认关闭（CHIP_LOCAL_ESTIMATE_ENABLED），开启后仅作为兜底、不影响正常链路。
+        """
+        import os as _os
+        from src.config import parse_env_bool, parse_env_int
+        from .chip_estimator import (
+            DEFAULT_LOOKBACK_DAYS,
+            MIN_DAILY_ROWS,
+            estimate_chip_distribution,
+            infer_circulating_shares,
+        )
+
+        if not parse_env_bool(_os.getenv('CHIP_LOCAL_ESTIMATE_ENABLED'), default=False):
+            return None
+
+        lookback_days = parse_env_int(
+            _os.getenv('CHIP_LOCAL_ESTIMATE_LOOKBACK'),
+            DEFAULT_LOOKBACK_DAYS,
+            field_name='CHIP_LOCAL_ESTIMATE_LOOKBACK',
+            minimum=MIN_DAILY_ROWS,
+        )
+
+        started_at = time.time()
+        try:
+            record_provider_run_started(
+                data_type="chip",
+                provider="local_estimate",
+                operation="estimate_chip_distribution",
+            )
+            quote = self.get_realtime_quote(stock_code, log_final_failure=False)
+            current_price = getattr(quote, 'price', None) if quote else None
+            circ_shares = infer_circulating_shares(quote, current_price)
+            if not circ_shares:
+                logger.debug(
+                    "[筹码估算] %s 缺少流通市值或最新价，无法估算", stock_code
+                )
+                record_provider_run(
+                    data_type="chip",
+                    provider="local_estimate",
+                    operation="estimate_chip_distribution",
+                    success=False,
+                    latency_ms=int((time.time() - started_at) * 1000),
+                    error_type="missing_input",
+                    error_message="circ_mv or price unavailable",
+                    record_count=0,
+                )
+                return None
+
+            # 多取一些交易日，抵消停牌/节假日造成的有效样本缺口
+            daily_df, _daily_source = self.get_daily_data(
+                stock_code, days=int(lookback_days) + 40
+            )
+            chip = estimate_chip_distribution(
+                stock_code,
+                daily_df,
+                float(current_price),
+                float(circ_shares),
+                lookback_days=int(lookback_days),
+            )
+            latency_ms = int((time.time() - started_at) * 1000)
+            if _is_meaningful_chip_distribution(chip):
+                record_provider_run(
+                    data_type="chip",
+                    provider="local_estimate",
+                    operation="estimate_chip_distribution",
+                    success=True,
+                    latency_ms=latency_ms,
+                    record_count=1,
+                )
+                logger.info(
+                    "[筹码分布] %s 外部数据源均失败，改用本地估算兜底（source=%s）",
+                    stock_code,
+                    getattr(chip, 'source', 'local_estimate'),
+                )
+                return chip
+            record_provider_run(
+                data_type="chip",
+                provider="local_estimate",
+                operation="estimate_chip_distribution",
+                success=False,
+                latency_ms=latency_ms,
+                error_type="empty",
+                error_message="local estimate produced no usable metrics",
+                record_count=0,
+            )
+            return None
+        except Exception as exc:
+            error_type, error_reason = summarize_exception(exc)
+            record_provider_run(
+                data_type="chip",
+                provider="local_estimate",
+                operation="estimate_chip_distribution",
+                success=False,
+                latency_ms=int((time.time() - started_at) * 1000),
+                error_type=error_type,
+                error_message=error_reason,
+            )
+            logger.warning("[筹码估算] %s 本地估算兜底失败: %s", stock_code, exc)
+            return None
+
+    @staticmethod
+    def _sleep_chip_retry(attempt: int) -> None:
+        """筹码重试退避：指数递增并加抖动，避免与上游限流窗口对齐。"""
+        delay = min(2.0 ** attempt, 4.0) + random.uniform(0.0, 0.6)
+        logger.debug("[筹码分布] 重试前等待 %.2f 秒", delay)
+        time.sleep(delay)
 
     def get_stock_name(self, stock_code: str, allow_realtime: bool = True) -> Optional[str]:
         """
