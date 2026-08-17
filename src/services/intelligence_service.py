@@ -26,6 +26,8 @@ from src.storage import IntelligenceSource, INTELLIGENCE_ITEM_NULL_SCOPE_VALUE
 from src.services.run_diagnostics import sanitize_diagnostic_text
 
 logger = logging.getLogger(__name__)
+# 模板专用字段，不参与资讯源实体的创建（create_source 只认下面白名单里的业务字段）。
+_TEMPLATE_INTERNAL_KEYS = {"template_id", "auto_enabled"}
 _ALLOWED_SOURCE_TYPES = {"rss", "atom", "newsnow"}
 _ALLOWED_SCOPE_TYPES = {"symbol", "market", "sector"}
 _ALLOWED_MARKETS = {"cn", "hk", "us", "jp", "kr", "tw", "global"}
@@ -62,8 +64,125 @@ _BUILTIN_SOURCE_TEMPLATES = [
         "source_type": "rss",
         "url": "https://feeds.content.dowjones.io/public/rss/mw_topstories",
         "scope_type": "market",
-        "market": "global",
+        # 标 us 而非 global：查询方（大盘复盘与个股链路）都按具体市场做等值匹配
+        # （market == "cn"/"us"/"hk"），没有任何调用方查 market="global"，
+        # 标 global 的源抓下来后永远取不出来。MarketWatch 以美股内容为主，归 us。
+        "market": "us",
+        # 不参与自动拉取。实测该频道 10 条里 6 条是 personal finance 与生活类
+        # （社保领取、Medicaid、奖金个税、Roth 转换、地中海饮食、租房还是买房），
+        # 只有 4 条与市场相关。大盘复盘按来源轮转分配槽位后，低质源会稳定占位，
+        # 因此这部分名额改由 CNBC Economy 承接。模板保留，需要时可手动启用。
+        # 同频道的其他 feed 也都不合适：mw_realtimeheadlines 与 mw_marketpulse
+        # 最新条目停在 2024/2025 年（已停更），mw_bulletins 内容同样混杂。
+        "auto_enabled": False,
         "description": "Public market news RSS for global market context. Test before enabling.",
+    },
+    # --- 海外财经媒体，直接用各家官方 RSS，不经 RSSHub ---
+    #
+    # RSSHub 的 /bloomberg/:site 与 /cnbc/rss/:id 本质上就是包装这些官方 feed，
+    # 再额外逐条抓正文补全内容。对本项目没有必要：复盘只用标题和摘要，而抓正文
+    # 是失败率最高的一环（Bloomberg 路由自己标了 antiCrawler: true，且 pMap
+    # concurrency=1 逐条串行）。直连官方 feed 少一层故障点，也更快。
+    #
+    # 全部实测通过（HTTP 200、条目带 pubDate，能过严格时效过滤）。
+    # 路透没有加：官方 reutersagency feed 返回 404，legacy feeds.reuters.com
+    # 已停用且连接超时，RSSHub 也没有 reuters 路由。
+    {
+        "template_id": "bloomberg-markets",
+        "name": "Bloomberg Markets",
+        "source_type": "rss",
+        "url": "https://www.bloomberg.com/feeds/markets/news.rss",
+        "scope_type": "market",
+        "market": "us",
+        "description": "彭博市场版官方 RSS，美股与全球资产价格主线。",
+    },
+    {
+        "template_id": "bloomberg-economics",
+        "name": "Bloomberg Economics",
+        "source_type": "rss",
+        "url": "https://www.bloomberg.com/feeds/economics/news.rss",
+        "scope_type": "market",
+        "market": "us",
+        "description": "彭博经济版官方 RSS，宏观数据与央行政策。",
+    },
+    {
+        "template_id": "bloomberg-technology",
+        "name": "Bloomberg Technology",
+        "source_type": "rss",
+        "url": "https://www.bloomberg.com/feeds/technology/news.rss",
+        "scope_type": "market",
+        "market": "us",
+        "description": "彭博科技版官方 RSS，AI 与半导体产业链，对 A 股科技板块传导判断有用。",
+    },
+    {
+        "template_id": "cnbc-finance",
+        "name": "CNBC Finance",
+        "source_type": "rss",
+        "url": "https://www.cnbc.com/id/10000664/device/rss/rss.html",
+        "scope_type": "market",
+        "market": "us",
+        "description": "CNBC 金融频道官方 RSS，盘面情绪与个股异动。",
+    },
+    {
+        "template_id": "cnbc-economy",
+        "name": "CNBC Economy",
+        "source_type": "rss",
+        "url": "https://www.cnbc.com/id/20910258/device/rss/rss.html",
+        "scope_type": "market",
+        "market": "us",
+        # 接替 MarketWatch Top Stories 的槽位。实测 10 条全部为宏观市场内容
+        # （PPI、CPI、财政赤字、就业报告、Fed 通胀路径），摘要 77~160 字，
+        # 无 personal finance 混杂。
+        "description": "CNBC 经济频道官方 RSS，通胀、就业与联储政策路径。",
+    },
+    # 雅虎财经（https://finance.yahoo.com/news/rssindex）实测可用但 description
+    # 为空，只有标题；而它条目多、更新快，会在「取最新 6 条」的窗口里挤掉
+    # Bloomberg / CNBC 那些带摘要的条目，因此不纳入。
+]
+
+# 自建 RSSHub 资讯源。仅当配置了 RSSHUB_BASE_URL 时才会注册，留空则完全不生效。
+#
+# market 的归属按「哪个复盘链路需要它」来定，而不是按内容的地理范围 —— 因为
+# IntelligenceItem.market 是等值匹配，标 global 的源永远取不到（见上面的说明）。
+# 所以金十这种全球宏观/外盘资讯归到 us，让美股复盘能吃到。
+#
+# 路由取自 RSSHub 源码 lib/routes/ 下的 path 定义，均为 ofetch 直连上游 API，
+# 不需要 Playwright，因此单容器 + CACHE_TYPE=memory 就够。
+_RSSHUB_DEFAULT_SOURCE_DEFS = [
+    {
+        "template_id": "rsshub-cls-telegraph",
+        "name": "RSSHub 财联社电报",
+        "route": "/cls/telegraph",
+        "market": "cn",
+        "description": "财联社电报全量快讯，A 股盘面与题材消息的主力来源。",
+    },
+    {
+        "template_id": "rsshub-cls-hot",
+        "name": "RSSHub 财联社热门",
+        "route": "/cls/hot",
+        "market": "cn",
+        "description": "财联社热门文章排行，反映市场关注度集中在哪些方向。",
+    },
+    {
+        "template_id": "rsshub-10jqka-realtimenews",
+        "name": "RSSHub 同花顺实时新闻",
+        "route": "/10jqka/realtimenews",
+        "market": "cn",
+        "description": "同花顺实时新闻，补充 A 股个股与行业动态。",
+    },
+    {
+        "template_id": "rsshub-jin10",
+        "name": "RSSHub 金十市场快讯",
+        "route": "/jin10/1",
+        "market": "us",
+        "description": "金十数据重要市场快讯，覆盖全球宏观与外盘事件，供美股复盘使用。",
+    },
+    {
+        "template_id": "rsshub-gelonghui-live",
+        "name": "RSSHub 格隆汇实时快讯",
+        "route": "/gelonghui/live",
+        "market": "hk",
+        "description": "格隆汇实时快讯，港股与中概股市场上下文。",
     },
 ]
 _NEWSNOW_DEFAULT_SOURCE_DEFS = [
@@ -180,17 +299,31 @@ class IntelligenceService:
         )
         if selected is None:
             raise IntelligenceServiceError(f"Intelligence source template not found: {template_id}")
-        payload = {key: value for key, value in selected.items() if key != "template_id"}
+        payload = {key: value for key, value in selected.items() if key not in _TEMPLATE_INTERNAL_KEYS}
         payload.update({key: value for key, value in (overrides or {}).items() if value is not None})
         return self.create_source(payload)
+
+    def _auto_enabled_source_templates(self) -> List[Dict[str, Any]]:
+        """内置模板中参与「默认源」的部分。
+
+        标了 ``auto_enabled: False`` 的模板会被排除：它们仍出现在模板列表里、
+        仍可用 create_source_from_template 单独创建，只是不算默认源、也不参与
+        自动拉取。用于内容质量不适合直接进复盘上下文的源
+        （当前是 MarketWatch Top Stories）。
+        """
+        return [
+            template
+            for template in self._builtin_source_templates()
+            if template.get("auto_enabled", True)
+        ]
 
     def create_default_sources(self, overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         request_fields = dict(overrides or {})
         request_fields.setdefault("enabled", False)
         created_count = 0
         items = []
-        for template in self._builtin_source_templates():
-            payload = {key: value for key, value in template.items() if key != "template_id"}
+        for template in self._auto_enabled_source_templates():
+            payload = {key: value for key, value in template.items() if key not in _TEMPLATE_INTERNAL_KEYS}
             payload.update({key: value for key, value in request_fields.items() if value is not None})
             existing = self.repo.get_source_by_name(str(payload["name"]))
             if existing is not None:
@@ -206,7 +339,7 @@ class IntelligenceService:
         created_count = 0
         enabled_count = 0
         errors = []
-        templates = self._builtin_source_templates()
+        templates = self._auto_enabled_source_templates()
         for template in templates:
             name = str(template["name"])
             try:
@@ -216,7 +349,7 @@ class IntelligenceService:
                         self.repo.update_source_enabled(existing.id, True)
                         enabled_count += 1
                     continue
-                payload = {key: value for key, value in template.items() if key != "template_id"}
+                payload = {key: value for key, value in template.items() if key not in _TEMPLATE_INTERNAL_KEYS}
                 payload["enabled"] = True
                 self.create_source(payload)
                 created_count += 1
@@ -389,6 +522,26 @@ class IntelligenceService:
             "description": description,
         }
 
+    def _trusted_private_origins(self) -> set:
+        """运维通过环境变量显式配置的自建资讯源 origin，允许指向本机 / 私网。
+
+        资讯源 URL 默认拦截私网地址，是为了防止通过 API 提交任意内网地址（SSRF）。
+        但自建 RSSHub 通常与分析进程跑在同一台机器或同一个 CI runner 内
+        （如 ``http://localhost:1200``），这类地址由部署方通过 ``RSSHUB_BASE_URL``
+        指定，不属于外部可控输入。
+
+        放行范围刻意收得很窄：只放行配置值本身的 origin（scheme + host + port）
+        精确匹配，通过 API 创建的其他源、以及重定向到别的私网地址，都仍然会被拦截。
+        不配置该环境变量时返回空集合，行为与上游完全一致。
+        """
+        raw = str(getattr(self.config, "rsshub_base_url", "") or "").strip()
+        if not raw:
+            return set()
+        parsed = urlparse(raw if "://" in raw else f"http://{raw}")
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+            return set()
+        return {f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"}
+
     def _validate_url(self, raw_url: str, *, allow_no_url: bool = False) -> None:
         if allow_no_url and raw_url.startswith("no-url:intel:"):
             return
@@ -400,6 +553,8 @@ class IntelligenceService:
         hostname = (parsed.hostname or "").strip().lower().rstrip(".")
         if not hostname:
             raise IntelligenceServiceError("source url host is required")
+        if f"{parsed.scheme.lower()}://{parsed.netloc.lower()}" in self._trusted_private_origins():
+            return
         if hostname in _PRIVATE_HOSTNAMES or hostname.endswith(".local"):
             raise IntelligenceServiceError("source url host is not allowed")
         has_public_address = False
@@ -556,6 +711,14 @@ class IntelligenceService:
     def _get_with_validated_dns(self, raw_url: str, **kwargs: Any) -> requests.Response:
         parsed = urlparse(raw_url)
         target_hostname = self._normalize_hostname(parsed.hostname)
+        # 抓取时的 DNS 守卫是第二道 SSRF 防线，会按解析出的真实 IP 拦私网地址。
+        # 受信任的自建源（RSSHUB_BASE_URL）本身就指向本机 / 私网，这里必须与
+        # _validate_url 保持同一放行口径，否则源能创建但永远抓不动
+        # （表现为 "source url must not target private or local network addresses"）。
+        if f"{parsed.scheme.lower()}://{parsed.netloc.lower()}" in self._trusted_private_origins():
+            request_kwargs = dict(kwargs)
+            request_kwargs.setdefault("proxies", _DISABLE_REQUEST_PROXIES)
+            return requests.get(raw_url, **request_kwargs)
         original_getaddrinfo = socket.getaddrinfo
 
         def guarded_getaddrinfo(host: Any, port: Any, *args: Any, **inner_kwargs: Any) -> Any:
@@ -813,7 +976,26 @@ class IntelligenceService:
                 "market": item["market"],
                 "description": item["description"],
             })
+        rsshub_base = str(getattr(self.config, "rsshub_base_url", "") or "").strip().rstrip("/")
+        if rsshub_base:
+            for item in _RSSHUB_DEFAULT_SOURCE_DEFS:
+                templates.append({
+                    "template_id": item["template_id"],
+                    "name": item["name"],
+                    "source_type": "rss",
+                    "url": self._build_rsshub_url(rsshub_base, item["route"]),
+                    "scope_type": "market",
+                    "market": item["market"],
+                    "description": item["description"],
+                })
         return templates
+
+    def _build_rsshub_url(self, base_url: str, route: str) -> str:
+        """拼接 RSSHub 路由并带上 limit，避免单源一次拉回过多条目。"""
+        parsed = urlparse(f"{base_url}/{route.lstrip('/')}")
+        query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        query.setdefault("limit", str(max(1, min(int(self.config.news_intel_max_items_per_source or 50), 100))))
+        return urlunparse(parsed._replace(query=urlencode(query)))
 
     def _build_newsnow_url(self, source_id: str) -> str:
         base_url = (self.config.newsnow_base_url or "https://newsnow.busiyi.world").strip().rstrip("/")
