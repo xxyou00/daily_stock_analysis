@@ -993,6 +993,7 @@ class Config:
     news_intel_max_items_per_source: int = 50  # 单次每个资讯源最多采集条数
     news_intel_auto_fetch_enabled: bool = False  # 是否在分析前自动初始化并拉取本地资讯源
     newsnow_base_url: str = "https://newsnow.busiyi.world"  # NewsNow HTTP API base URL (数据源侧，不影响 LLM/provider base URL)
+    rsshub_base_url: str = ""  # RSSHub base URL（数据源侧）。留空则不注册任何 RSSHub 资讯源，行为与上游一致
     bias_threshold: float = 5.0  # 乖离率阈值（%），超过此值提示不追高
 
     # === Agent 模式配置 ===
@@ -1899,6 +1900,7 @@ class Config:
                 False,
             ),
             newsnow_base_url=((os.getenv('NEWSNOW_BASE_URL') or '').strip().rstrip('/') or 'https://newsnow.busiyi.world'),
+            rsshub_base_url=((os.getenv('RSSHUB_BASE_URL') or '').strip().rstrip('/')),
             bias_threshold=parse_env_float(os.getenv('BIAS_THRESHOLD'), 5.0, field_name='BIAS_THRESHOLD', minimum=1.0),
             agent_backend=(os.getenv('AGENT_BACKEND', 'auto') or 'auto').strip().lower(),
             agent_generation_backend=agent_generation_backend,
