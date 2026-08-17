@@ -237,6 +237,42 @@ def _build_dividend_payload(
     }
 
 
+def _normalize_wide_financial_df(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    """把「指标为行、报告期为列」的宽表转置为「报告期为行、指标为列」的长表。
+
+    AkShare ``stock_financial_abstract`` 返回的是宽表，列形如
+    ``['选项', '指标', '20260331', '20251231', ...]``，指标名位于单元格值中；
+    而 :func:`_extract_latest_row` / :func:`_pick_by_keywords` 均假设指标名在列名上
+    （``stock_financial_analysis_indicator`` 那种长表）。两者不匹配会让所有财报字段
+    静默解析为 ``None``，表现为报告中营业收入 / 归母净利润 / ROE 全部为 N/A。
+
+    转置后报告期列顺序（新 -> 旧）成为行顺序，``_extract_latest_row`` 的
+    ``df.iloc[0]`` 兜底刚好取到最新报告期；``report_date`` 也能通过关键词
+    「报告期」命中新生成的索引列。
+
+    非宽表输入原样返回，因此对其他 AkShare 接口无副作用。
+    """
+    if df is None or df.empty:
+        return df
+    columns = [str(c) for c in df.columns]
+    if "指标" not in columns:
+        return df
+    try:
+        work = df.copy()
+        work.columns = columns
+        if "选项" in work.columns:
+            work = work.drop(columns=["选项"])
+        work = work.set_index("指标")
+        # 指标名可能重复（不同报表同名科目），保留首次出现，避免转置后列名冲突
+        work = work[~work.index.duplicated(keep="first")]
+        transposed = work.T
+        transposed.index.name = "报告期"
+        return transposed.reset_index()
+    except Exception as exc:  # pragma: no cover - 结构异常时保持 fail-open
+        logger.debug("normalize wide financial df failed: %s", exc)
+        return df
+
+
 def _extract_latest_row(df: pd.DataFrame, stock_code: str) -> Optional[pd.Series]:
     """
     Select the most relevant row for the given stock.
@@ -309,6 +345,7 @@ class AkshareFundamentalAdapter:
             ("stock_financial_analysis_indicator", {}),
         ])
         result["errors"].extend(fin_errors)
+        fin_df = _normalize_wide_financial_df(fin_df)
         if fin_df is not None:
             row = _extract_latest_row(fin_df, stock_code)
             if row is not None:
