@@ -13,6 +13,7 @@ A股自选股智能分析系统 - 搜索服务模块
 
 import logging
 import multiprocessing
+import os
 import re
 import threading
 import time
@@ -37,6 +38,7 @@ from data_provider.us_index_mapping import is_us_index_code
 from src.config import (
     NEWS_STRATEGY_WINDOWS,
     normalize_news_strategy_profile,
+    parse_env_bool,
     resolve_news_window_days,
 )
 from src.data.stock_mapping import (
@@ -3659,6 +3661,23 @@ class SearchService:
 
         return None
 
+    @staticmethod
+    def _provider_prefilters_freshness(provider) -> bool:
+        """provider 是否已在服务端按时效过滤，可免除客户端 published_date 二次核验。
+
+        SearXNG 请求时已带 time_range，但返回结果普遍不含 publishedDate，
+        客户端严格校验会把全部结果按 drop_unknown 丢弃，线上表现为情报 0 条
+        （日志特征：``total=6, kept=0, drop_unknown=6``）。
+
+        代价：``_time_range`` 粒度只有 day/week/month/year，3 天窗口实际落到
+        week，且部分上游引擎会忽略 time_range，因此放宽后可能混入更早的内容。
+        所以默认关闭，只在显式设置 ``SEARXNG_TRUST_TIME_RANGE`` 时生效，
+        且只作用于 SearXNG —— Tavily 等会返回真实日期的 provider 仍走严格校验。
+        """
+        if not isinstance(provider, SearXNGSearchProvider):
+            return False
+        return parse_env_bool(os.getenv('SEARXNG_TRUST_TIME_RANGE'), default=False)
+
     def _filter_news_response(
         self,
         response: SearchResponse,
@@ -4136,6 +4155,7 @@ class SearchService:
                     response,
                     search_days=search_days,
                     max_results=provider_max_results,
+                    keep_unknown=self._provider_prefilters_freshness(provider),
                     log_scope=f"{stock_code}:{provider.name}:stock_news",
                 )
                 had_provider_success = had_provider_success or bool(response.success)
@@ -4552,6 +4572,7 @@ class SearchService:
                     response,
                     search_days=search_days,
                     max_results=provider_max_results,
+                    keep_unknown=self._provider_prefilters_freshness(provider),
                     log_scope=f"{stock_code}:{provider.name}:{dim['name']}",
                 )
             elif dim['name'] in self.ANALYTICAL_INTEL_DIMENSIONS:
