@@ -13,6 +13,7 @@
 import logging
 import re
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
 from inspect import getattr_static
@@ -126,7 +127,21 @@ class MarketAnalyzer:
     4. 搜索市场新闻
     5. 生成大盘复盘报告
     """
-    
+
+    # 进入 prompt 的市场新闻条数上限，_build_review_prompt 直接引用本常量。
+    # 资讯池接入后可用条目从个位数涨到几百条（17 个源），窗口太窄会浪费素材，
+    # 因此从 6 提到 12。按每条 title 90 + snippet 220 估算约 3.7K 字符，
+    # 相对 8192 的 max_tokens 仍有充足余量。
+    _MARKET_NEWS_PROMPT_SLOTS = 12
+    # 上述槽位中预留给搜索结果的条数，其余优先给本地资讯池。
+    # 刻意不随总量翻倍：搜索结果没有发布时间、来源不可控，多给名额只是把
+    # 低质条目塞进上下文。总量翻倍后资讯池实际可用槽位从 4 涨到 10。
+    # 设 0 表示资讯池可以占满；搜索结果不足时该配额自动让给资讯池。
+    _MARKET_NEWS_SEARCH_RESERVED_SLOTS = 2
+    # 进入结构化输出（build_market_review_payload）的条数上限。
+    # 保持略大于 prompt 槽位，让下游消费方能看到 prompt 之外的备选条目。
+    _MARKET_NEWS_PAYLOAD_SLOTS = 16
+
     def __init__(
         self,
         search_service: Optional[SearchService] = None,
@@ -810,7 +825,10 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 "top": list(overview.top_concepts or []),
                 "bottom": list(overview.bottom_concepts or []),
             },
-            "news": [self._normalize_news_item(item) for item in (news or [])[:8]],
+            "news": [
+                self._normalize_news_item(item)
+                for item in (news or [])[: self._MARKET_NEWS_PAYLOAD_SLOTS]
+            ],
             "sections": sections,
             "markdown_report": report,
         }
@@ -1426,6 +1444,16 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             direction = "↑" if idx.change_pct > 0 else "↓" if idx.change_pct < 0 else "-"
             indices_text += f"- {idx.name}: {idx.current:.2f} ({direction}{abs(idx.change_pct):.2f}%)\n"
         
+        # 资金动向段落：A 股为龙虎榜，美股为板块/龙头动向（美股无龙虎榜制度）。
+        # fail-open：取不到数据返回空串，不影响复盘生成。
+        capital_flow_block = ""
+        try:
+            from src.services.capital_flow_overview import build_capital_flow_block
+
+            capital_flow_block = build_capital_flow_block(self.region, review_language)
+        except Exception as exc:
+            logger.debug("capital flow block skipped: %s", exc)
+
         # 板块信息
         top_sectors_text = self._format_ranking_summary(overview.top_sectors)
         bottom_sectors_text = self._format_ranking_summary(overview.bottom_sectors)
@@ -1434,7 +1462,7 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         
         # 新闻信息 - 支持 SearchResult 对象或字典
         news_text = ""
-        for i, n in enumerate(news[:6], 1):
+        for i, n in enumerate(news[: self._MARKET_NEWS_PROMPT_SLOTS], 1):
             # 兼容 SearchResult 对象和字典
             title = self._compact_news_text(self._get_news_field(n, "title"), limit=90)
             snippet = self._compact_news_text(self._get_news_field(n, "snippet"), limit=220)
@@ -1569,6 +1597,8 @@ Concept lagging: {bottom_concepts_text if bottom_concepts_text else "N/A"}"""
 
 {sector_block}
 
+{capital_flow_block}
+
 {data_limits_block}
 
 ## Market News
@@ -1622,6 +1652,8 @@ Output the report content directly, no extra commentary.
 {stats_block}
 
 {sector_block}
+
+{capital_flow_block}
 
 {data_limits_block}
 
@@ -1830,6 +1862,30 @@ Market conditions can change quickly. The data above is for reference only and d
             structured_payload=structured_payload,
         )
 
+    @staticmethod
+    def _interleave_by_source(items: List[Dict]) -> List[Dict]:
+        """按来源轮转排列，避免高频源占满前排槽位。
+
+        资讯池按 published_at 倒序返回，而各源更新频率差着量级：金十快讯是
+        分钟级，Bloomberg / CNBC 是小时级，财联社电报还会连发同类公告。
+        纯时间排序的结果就是高频源把前排铺满，其他源即使有更相关的内容也进不来。
+
+        做法是按来源分组后轮流取一条。组内保持原有的时间倒序，组间顺序由各组
+        首条出现的先后决定（输入已是时间倒序，所以最新那条所属的源仍排最前），
+        因此"最新的一条"依然在第一位，只是后面不再被同一个源连续占据。
+        """
+        groups: Dict[str, List[Dict]] = {}
+        for item in items:
+            # dict 保持插入顺序，等价于按各组最新条目的时间先后排列
+            groups.setdefault(str(item.get("source") or ""), []).append(item)
+        ordered: List[Dict] = []
+        while groups:
+            for name in list(groups.keys()):
+                ordered.append(groups[name].pop(0))
+                if not groups[name]:
+                    del groups[name]
+        return ordered
+
     def _merge_persisted_market_intelligence(self, news: List) -> List:
         """Merge local persisted market intelligence and search news with bounded prompt/payload slot preservation."""
         search_news = list(news or [])
@@ -1847,7 +1903,8 @@ Market conditions can change quickly. The data above is for reference only and d
                 market=self.region,
                 published_days=max(1, int(self.config.get_effective_news_window_days() or 1)),
                 page=1,
-                page_size=6,
+                # 多取一些候选：与搜索结果去重后可能剩不足，且下面只会用前若干条。
+                page_size=self._MARKET_NEWS_PROMPT_SLOTS * 2,
             )
             for item in payload.get("items", []):
                 if not isinstance(item, dict):
@@ -1865,16 +1922,41 @@ Market conditions can change quickly. The data above is for reference only and d
                 })
         except Exception as exc:
             logger.debug("[大盘] %s action=load_local_intelligence status=failed error=%s", self._log_context(), exc)
-        merged_news = []
-        merged_local_index = 0
-        merged_search_index = 0
-        while merged_local_index < len(merged_local) or merged_search_index < len(search_news):
-            if merged_local_index < len(merged_local):
-                merged_news.append(merged_local[merged_local_index])
-                merged_local_index += 1
-            if merged_search_index < len(search_news):
-                merged_news.append(search_news[merged_search_index])
-                merged_search_index += 1
+
+        # 资讯池内部按来源轮转，避免高频源（金十快讯分钟级更新）铺满前排。
+        merged_local = self._interleave_by_source(merged_local)
+
+        # 资讯池条目优先占位，搜索结果补剩余槽位。
+        #
+        # 原实现是严格交替（local, search, local, search...），在只取前 6 条的窗口下
+        # 等于把一半名额固定分给搜索结果。但两者质量差距明显：资讯池条目来自固定源
+        # （Bloomberg、CNBC、财联社、金十等），带真实发布时间和摘要；SearXNG 结果没有
+        # publishedDate，来源也不可控，实测混进过聚合站首页和配资广告页。
+        #
+        # 也不让资讯池占满：保留固定配额给搜索，避免某个源连发同类内容（例如财联社
+        # 电报的国债续发行公告）铺满整个窗口，丢掉其他视角。搜索结果不足时该配额
+        # 自动让给资讯池，反之亦然。
+        slots = self._MARKET_NEWS_PROMPT_SLOTS
+        reserved_for_search = min(self._MARKET_NEWS_SEARCH_RESERVED_SLOTS, len(search_news))
+        local_head = merged_local[: max(0, slots - reserved_for_search)]
+        search_head = search_news[: max(0, slots - len(local_head))]
+        merged_news = (
+            local_head
+            + search_head
+            + merged_local[len(local_head):]
+            + search_news[len(search_head):]
+        )
+        logger.info(
+            "[大盘] %s action=merge_market_news local=%d search=%d head_local=%d head_search=%d slots=%d head_sources=%s",
+            self._log_context(),
+            len(merged_local),
+            len(search_news),
+            len(local_head),
+            len(search_head),
+            slots,
+            # 前排各来源的占位数，用于直接核对轮转是否生效
+            dict(Counter(str(item.get("source") or "-") for item in local_head)),
+        )
         return merged_news
 
     def run_daily_review(self) -> str:
