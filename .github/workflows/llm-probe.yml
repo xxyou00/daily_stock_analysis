@@ -6,15 +6,19 @@ on:
       models:
         description: '待探活模型（逗号分隔，litellm 形式，会自动剥离 openai/ 前缀）'
         required: false
-        default: 'openai/z-ai/glm-5.2,openai/deepseek-ai/deepseek-v4-flash-0731,openai/moonshotai/kimi-k2.6'
+        default: 'openai/minimaxai/minimax-m3'
       timeout_s:
         description: '单次请求超时秒数'
         required: false
-        default: '120'
+        default: '180'
       rounds:
-        description: '每个模型探活轮数（504 是容量问题，多轮更能反映真实可用率）'
+        description: '每个模型探活轮数'
         required: false
-        default: '3'
+        default: '2'
+      max_tokens_list:
+        description: 'max_tokens 梯度（逗号分隔）。thinking 模型在小额度下会只输出思维链、content 为空'
+        required: false
+        default: '64,256,8192'
 
 concurrency:
   group: llm-probe-${{ github.ref }}
@@ -33,6 +37,7 @@ jobs:
           MODELS_INPUT: ${{ inputs.models }}
           TIMEOUT_S: ${{ inputs.timeout_s }}
           ROUNDS: ${{ inputs.rounds }}
+          MT_LIST: ${{ inputs.max_tokens_list }}
         run: |
           set -uo pipefail
           BASE="${BASE_URL:-https://integrate.api.nvidia.com/v1}"
@@ -47,27 +52,30 @@ jobs:
           echo "key_len=${#OPENAI_API_KEY} key_prefix=${OPENAI_API_KEY:0:6}"
 
           # ---------- 1. 网关模型清单 ----------
-          echo "== GET /models =="
           MODELS_CODE=$(curl -sS -o /tmp/models.json -w '%{http_code}' \
             --max-time 60 \
             -H "Authorization: Bearer $OPENAI_API_KEY" \
             "$BASE/models" || echo "000")
-          echo "http_code=$MODELS_CODE"
           TOTAL=$(jq -r '(.data // []) | length' /tmp/models.json 2>/dev/null || echo 0)
-          echo "models_total=$TOTAL"
+          echo "GET /models http_code=$MODELS_CODE models_total=$TOTAL"
+
+          echo "== 清单中所有 minimax 条目 =="
+          jq -r '(.data // [])[].id | select(test("minimax"; "i"))' /tmp/models.json 2>/dev/null || echo "(none)"
 
           {
             echo "## LLM Probe"
             echo ""
-            echo "- base_url: \`$BASE\`"
+            echo "- base_url: \`$BASE\`  ·  key_len \`${#OPENAI_API_KEY}\` prefix \`${OPENAI_API_KEY:0:6}\`"
             echo "- \`GET /models\` → HTTP \`$MODELS_CODE\`，共 \`$TOTAL\` 个模型"
             echo ""
-            echo "| 模型 | 在清单中 | 轮次 | HTTP | 耗时(s) | 结果 |"
-            echo "| --- | --- | --- | --- | --- | --- |"
+            echo "| 模型 | 清单 | max_tokens | 轮 | HTTP | 耗时(s) | finish | content长度 | reasoning长度 | 备注 |"
+            echo "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
           } >> "$GITHUB_STEP_SUMMARY"
 
-          # ---------- 2. 逐模型探活 ----------
+          # ---------- 2. 逐模型 × max_tokens 梯度探活 ----------
           IFS=',' read -ra RAW_MODELS <<< "$MODELS_INPUT"
+          IFS=',' read -ra MTS <<< "$MT_LIST"
+
           for raw in "${RAW_MODELS[@]}"; do
             m="$(echo "$raw" | tr -d '[:space:]')"
             [ -z "$m" ] && continue
@@ -79,36 +87,57 @@ jobs:
               LISTED="❌"
             fi
             echo ""
-            echo "===== $real (listed=$LISTED) ====="
+            echo "########## $real (listed=$LISTED) ##########"
 
-            jq -n --arg model "$real" \
-              '{model:$model, messages:[{role:"user", content:"ping"}], max_tokens:16, temperature:1, stream:false}' \
-              > /tmp/req.json
+            for mt in "${MTS[@]}"; do
+              mt="$(echo "$mt" | tr -d '[:space:]')"
+              [ -z "$mt" ] && continue
 
-            for r in $(seq 1 "$ROUNDS"); do
-              OUT=$(curl -sS -o /tmp/resp.json -w '%{http_code} %{time_total}' \
-                --max-time "$TIMEOUT_S" \
-                -H "Authorization: Bearer $OPENAI_API_KEY" \
-                -H 'Content-Type: application/json' \
-                -H 'Accept: application/json' \
-                -d @/tmp/req.json \
-                "$BASE/chat/completions" 2>/tmp/curl.err || echo "000 0")
-              CODE="${OUT%% *}"
-              ELAPSED="${OUT##* }"
+              jq -n --arg model "$real" --argjson mt "$mt" \
+                '{model:$model,
+                  messages:[{role:"user", content:"用一句话说明沪深两市今日成交额环比变化的意义。"}],
+                  temperature:1, top_p:0.95, max_tokens:$mt, stream:false}' \
+                > /tmp/req.json
 
-              if [ "$CODE" = "200" ]; then
-                CONTENT=$(jq -r '(.choices[0].message.content // "") | tostring | .[0:80]' /tmp/resp.json 2>/dev/null)
-                USAGE=$(jq -c '.usage // {}' /tmp/resp.json 2>/dev/null)
-                RESULT="ok content=$(echo "$CONTENT" | tr -d '\n|') usage=$USAGE"
-              else
-                ERRMSG=$(jq -r '(.error.message // .detail // .title // .message // empty) | tostring' /tmp/resp.json 2>/dev/null)
-                [ -z "$ERRMSG" ] && ERRMSG=$(head -c 200 /tmp/resp.json 2>/dev/null | tr -d '\n|')
-                [ -z "$ERRMSG" ] && ERRMSG=$(head -c 200 /tmp/curl.err 2>/dev/null | tr -d '\n|')
-                RESULT="FAIL ${ERRMSG:-no-body}"
-              fi
+              for r in $(seq 1 "$ROUNDS"); do
+                OUT=$(curl -sS -o /tmp/resp.json -w '%{http_code} %{time_total}' \
+                  --max-time "$TIMEOUT_S" \
+                  -H "Authorization: Bearer $OPENAI_API_KEY" \
+                  -H 'Content-Type: application/json' \
+                  -H 'Accept: application/json' \
+                  -d @/tmp/req.json \
+                  "$BASE/chat/completions" 2>/tmp/curl.err || echo "000 0")
+                CODE="${OUT%% *}"
+                ELAPSED="${OUT##* }"
 
-              echo "round=$r http=$CODE time=${ELAPSED}s $RESULT"
-              echo "| \`$real\` | $LISTED | $r | \`$CODE\` | $ELAPSED | ${RESULT} |" >> "$GITHUB_STEP_SUMMARY"
+                FINISH="-"; CLEN="-"; RLEN="-"; NOTE=""
+                if [ "$CODE" = "200" ]; then
+                  FINISH=$(jq -r '.choices[0].finish_reason // "-"' /tmp/resp.json 2>/dev/null)
+                  CLEN=$(jq -r '(.choices[0].message.content // "") | tostring | length' /tmp/resp.json 2>/dev/null)
+                  RLEN=$(jq -r '(.choices[0].message.reasoning_content // .choices[0].message.reasoning // "") | tostring | length' /tmp/resp.json 2>/dev/null)
+                  USAGE=$(jq -c '.usage // {}' /tmp/resp.json 2>/dev/null)
+                  PREVIEW=$(jq -r '(.choices[0].message.content // "") | tostring | .[0:60]' /tmp/resp.json 2>/dev/null | tr -d '\n|')
+                  if [ "$CLEN" = "0" ]; then
+                    NOTE="⚠️ content 为空（thinking 吃满额度）"
+                  else
+                    NOTE="ok: ${PREVIEW}"
+                  fi
+                  echo "mt=$mt round=$r http=200 time=${ELAPSED}s finish=$FINISH content_len=$CLEN reasoning_len=$RLEN usage=$USAGE"
+                  echo "    preview: $PREVIEW"
+                  # 首轮完整 dump 一次，便于看响应结构里有没有 reasoning 字段
+                  if [ "$r" = "1" ] && [ "$mt" = "${MTS[0]}" ]; then
+                    echo "    message keys: $(jq -c '.choices[0].message | keys' /tmp/resp.json 2>/dev/null)"
+                  fi
+                else
+                  ERRMSG=$(jq -r '(.error.message // .detail // .title // .message // empty) | tostring' /tmp/resp.json 2>/dev/null)
+                  [ -z "$ERRMSG" ] && ERRMSG=$(head -c 240 /tmp/resp.json 2>/dev/null | tr -d '\n|')
+                  [ -z "$ERRMSG" ] && ERRMSG=$(head -c 240 /tmp/curl.err 2>/dev/null | tr -d '\n|')
+                  NOTE="FAIL ${ERRMSG:-no-body}"
+                  echo "mt=$mt round=$r http=$CODE time=${ELAPSED}s $NOTE"
+                fi
+
+                echo "| \`$real\` | $LISTED | $mt | $r | \`$CODE\` | $ELAPSED | $FINISH | $CLEN | $RLEN | $NOTE |" >> "$GITHUB_STEP_SUMMARY"
+              done
             done
           done
 
