@@ -59,8 +59,14 @@ jobs:
           TOTAL=$(jq -r '(.data // []) | length' /tmp/models.json 2>/dev/null || echo 0)
           echo "GET /models http_code=$MODELS_CODE models_total=$TOTAL"
 
-          echo "== 清单中所有 minimax 条目 =="
-          jq -r '(.data // [])[].id | select(test("minimax"; "i"))' /tmp/models.json 2>/dev/null || echo "(none)"
+          echo "== 网关全部模型 ID =="
+          jq -r '(.data // [])[].id' /tmp/models.json 2>/dev/null | sort || echo "(none)"
+
+          echo "== 关注家族匹配 =="
+          for kw in minimax kimi moonshot deepseek glm z-ai qwen; do
+            hits=$(jq -r --arg kw "$kw" '(.data // [])[].id | select(test($kw; "i"))' /tmp/models.json 2>/dev/null | paste -sd, -)
+            echo "  $kw -> ${hits:-(none)}"
+          done
 
           {
             echo "## LLM Probe"
