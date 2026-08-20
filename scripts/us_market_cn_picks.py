@@ -43,13 +43,21 @@ if str(REPO_ROOT) not in sys.path:
 
 logger = logging.getLogger("us_market_cn_picks")
 
-DEFAULT_PICK_COUNT = 10
+DEFAULT_SECTOR_COUNT = 4
+# 每个板块推荐的标的数。按板块成组给出，比一张扁平榜单更容易看出传导路径。
+PICKS_PER_SECTOR = 3
+# 只保留看多方向。承压/回避方向的判断放在美股复盘的「风险提示」里，
+# 不混进推荐列表——推荐列表里出现看空标的容易被误读成建议做空。
+_BULLISH_TOKENS = ("看多", "多头", "利好", "受益", "偏多", "正向", "bullish", "positive")
+_BEARISH_TOKENS = ("看空", "空头", "利空", "承压", "偏空", "负向", "回避", "bearish", "negative")
 
-# LLM 返回里允许出现的字段，多余字段忽略
-_PICK_FIELDS = ("code", "name", "sector", "logic", "linkage")
 
-
-def _build_prompt(us_review: str, pick_count: int, capital_flow: str = "") -> str:
+def _build_prompt(
+    us_review: str,
+    sector_count: int,
+    capital_flow: str = "",
+    picks_per_sector: int = PICKS_PER_SECTOR,
+) -> str:
     """构造 A 股推荐 prompt。要求严格 JSON，便于机器校验。"""
     capital_flow_section = ""
     if capital_flow.strip():
@@ -72,19 +80,24 @@ def _build_prompt(us_review: str, pick_count: int, capital_flow: str = "") -> st
 {capital_flow_section}
 ## 任务
 
-基于上述美股复盘{"与板块资金动向" if capital_flow_section else ""}，挑选 {pick_count} 只
-**可能受此影响的 A 股**，并说明传导逻辑。
+基于上述美股复盘{"与板块资金动向" if capital_flow_section else ""}，选出 {sector_count} 个
+**受美股走势正向影响的 A 股板块**，每个板块给出 {picks_per_sector} 只该板块内的代表标的。
 
 ## 硬性要求
 
-1. 必须是真实存在的 A 股，代码为 6 位数字（沪市 600/601/603/605、科创 688、
+1. **只输出看多方向。** 仅选择受益、受正向传导的板块与标的。承压、利空、
+   建议回避的方向一律不要出现在结果里——那部分判断由复盘的风险提示承担。
+   每个板块必须显式标注 `"direction": "看多"`。
+2. 必须是真实存在的 A 股，代码为 6 位数字（沪市 600/601/603/605、科创 688、
    深市 000/001/002、创业板 300）。不确定的标的直接不要写。
-2. 不要写港股、美股、ETF、退市股、ST 股。
-3. 传导逻辑必须落到具体的产业链或事件关系上（如「美股 AI 算力链上涨 → 国内光模块代工」），
-   禁止「受大盘情绪影响」这类空话。**若已给出板块资金动向，传导逻辑应优先锚定到
-   具体的领涨/领跌板块或龙头个股，而不是笼统的指数涨跌。**
-4. 不要给出目标价、买入价、止损位或仓位建议。
-5. {pick_count} 只标的应分散在不同板块，不要集中在同一条产业链。
+3. 不要写港股、美股、ETF、退市股、ST 股。
+4. 板块级传导逻辑必须落到具体的产业链或事件关系上（如「美股 AI 算力链上涨 →
+   国内光模块代工」），禁止「受大盘情绪影响」这类空话。**若已给出板块资金动向，
+   传导逻辑应优先锚定到具体的领涨板块或龙头个股，而不是笼统的指数涨跌。**
+5. 每只标的要写清它在该板块里的定位（龙头、弹性最大、纯度最高等），
+   不要三只标的用同一句话。
+6. 不要给出目标价、买入价、止损位或仓位建议。
+7. {sector_count} 个板块之间要分散，不要都落在同一条产业链上。
 
 ## 输出格式
 
@@ -92,13 +105,19 @@ def _build_prompt(us_review: str, pick_count: int, capital_flow: str = "") -> st
 
 {{
   "us_summary": "一句话概括美股当日核心变化（40 字以内）",
-  "picks": [
+  "sectors": [
     {{
-      "code": "600519",
-      "name": "股票中文名称",
-      "sector": "所属板块",
+      "sector": "板块名称",
+      "direction": "看多",
       "linkage": "对应的美股标的或板块",
-      "logic": "传导逻辑，50 字以内"
+      "logic": "板块级传导逻辑，50 字以内",
+      "picks": [
+        {{
+          "code": "600519",
+          "name": "股票中文名称",
+          "logic": "该标的在板块内的定位与受益点，40 字以内"
+        }}
+      ]
     }}
   ]
 }}
@@ -134,73 +153,206 @@ def _extract_json(text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _validate_picks(
-    raw_picks: List[Dict[str, Any]], pick_count: int
-) -> Tuple[List[Dict[str, str]], List[str]]:
-    """用本地股票索引校验推荐代码，返回 (有效推荐, 丢弃说明)。
+def _is_bullish(direction: str, logic: str = "") -> bool:
+    """判断板块方向是否为看多。
 
-    LLM 编造代码或记错名称都很常见，这里以索引为准：
+    prompt 已要求只输出看多，这里是机器兜底——模型偶尔仍会带出承压方向。
+    先看 direction 字段，命中看空词直接否决；字段为空时退回到逻辑描述里找线索，
+    两边都没有明确信号时按看多放行（prompt 的约束是只输出看多）。
+    """
+    text = f"{direction} {logic}".lower()
+    if any(token in text for token in _BEARISH_TOKENS):
+        return False
+    # 没有看空信号时放行：prompt 已要求只输出看多，缺少显式标注不作为否决理由。
+    return True
+
+
+def _normalize_sector_groups(parsed: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """把 LLM 输出归一成板块分组结构，兼容旧的扁平 picks 格式。"""
+    sectors = parsed.get("sectors")
+    if isinstance(sectors, list) and sectors:
+        return [item for item in sectors if isinstance(item, dict)]
+    # 兼容早期格式：扁平 picks 列表，按 sector 字段就地分组
+    flat = parsed.get("picks")
+    if not isinstance(flat, list):
+        return []
+    grouped: Dict[str, Dict[str, Any]] = {}
+    for item in flat:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("sector", "")).strip() or "综合"
+        bucket = grouped.setdefault(
+            name,
+            {
+                "sector": name,
+                "direction": str(item.get("direction", "")).strip(),
+                "linkage": str(item.get("linkage", "")).strip(),
+                "logic": "",
+                "picks": [],
+            },
+        )
+        bucket["picks"].append(item)
+    return list(grouped.values())
+
+
+def _validate_picks(
+    sector_groups: List[Dict[str, Any]],
+    sector_count: int,
+    picks_per_sector: int = PICKS_PER_SECTOR,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """校验板块分组推荐，返回 (有效分组, 丢弃说明)。
+
+    LLM 编造代码或记错名称都很常见，这里以本地股票索引为准：
     代码查不到就丢弃，名称不一致就用索引名覆盖。
+    看空方向的板块整组丢弃——推荐列表只保留看多。
     """
     from src.data.stock_index_loader import get_index_stock_name
 
-    valid: List[Dict[str, str]] = []
+    valid_groups: List[Dict[str, Any]] = []
     dropped: List[str] = []
     seen: set = set()
 
-    for item in raw_picks:
-        if not isinstance(item, dict):
-            continue
-        code = str(item.get("code", "")).strip()
-        code = re.sub(r"[^0-9]", "", code)
-        if len(code) != 6:
-            dropped.append(f"{item.get('code')}（代码格式非 6 位数字）")
-            continue
-        if code in seen:
-            continue
-        if not code.startswith(("600", "601", "603", "605", "688", "000", "001", "002", "300")):
-            dropped.append(f"{code}（非 A 股主板/创业板/科创板代码段）")
+    for group in sector_groups:
+        sector_name = str(group.get("sector", "")).strip() or "-"
+        direction = str(group.get("direction", "")).strip()
+        sector_logic = str(group.get("logic", "")).strip()
+
+        if not _is_bullish(direction, sector_logic):
+            dropped.append(f"{sector_name}（非看多方向：{direction or sector_logic[:16]}）")
             continue
 
-        index_name = None
-        try:
-            index_name = get_index_stock_name(code)
-        except Exception as exc:  # pragma: no cover - 索引异常不应中断流程
-            logger.debug("索引查询 %s 失败: %s", code, exc)
-
-        if not index_name:
-            dropped.append(f"{code}（本地股票索引中不存在）")
+        raw_picks = group.get("picks")
+        if not isinstance(raw_picks, list):
             continue
 
-        llm_name = str(item.get("name", "")).strip()
-        if llm_name and llm_name != index_name:
-            logger.info("代码 %s 名称以索引为准：LLM=%s -> 索引=%s", code, llm_name, index_name)
+        members: List[Dict[str, str]] = []
+        for item in raw_picks:
+            if not isinstance(item, dict):
+                continue
+            code = re.sub(r"[^0-9]", "", str(item.get("code", "")).strip())
+            if len(code) != 6:
+                dropped.append(f"{item.get('code')}（代码格式非 6 位数字）")
+                continue
+            if code in seen:
+                continue
+            if not code.startswith(
+                ("600", "601", "603", "605", "688", "000", "001", "002", "300")
+            ):
+                dropped.append(f"{code}（非 A 股主板/创业板/科创板代码段）")
+                continue
 
-        seen.add(code)
-        valid.append(
+            index_name = None
+            try:
+                index_name = get_index_stock_name(code)
+            except Exception as exc:  # pragma: no cover - 索引异常不应中断流程
+                logger.debug("索引查询 %s 失败: %s", code, exc)
+
+            if not index_name:
+                dropped.append(f"{code}（本地股票索引中不存在）")
+                continue
+
+            llm_name = str(item.get("name", "")).strip()
+            if llm_name and llm_name != index_name:
+                logger.info("代码 %s 名称以索引为准：LLM=%s -> 索引=%s", code, llm_name, index_name)
+
+            seen.add(code)
+            members.append(
+                {
+                    "code": code,
+                    "name": index_name,
+                    "logic": str(item.get("logic", "")).strip() or "-",
+                }
+            )
+            if len(members) >= picks_per_sector:
+                break
+
+        if not members:
+            continue
+
+        valid_groups.append(
             {
-                "code": code,
-                "name": index_name,
-                "sector": str(item.get("sector", "")).strip() or "-",
-                "linkage": str(item.get("linkage", "")).strip() or "-",
-                "logic": str(item.get("logic", "")).strip() or "-",
+                "sector": sector_name,
+                "direction": direction or "看多",
+                "linkage": str(group.get("linkage", "")).strip() or "-",
+                "logic": sector_logic or "-",
+                "picks": members,
             }
         )
-        if len(valid) >= pick_count:
+        if len(valid_groups) >= sector_count:
             break
 
-    return valid, dropped
+    return valid_groups, dropped
+
+
+def _attach_prev_change(groups: List[Dict[str, Any]]) -> str:
+    """给每只标的补上最近一个交易日的涨跌幅，返回该交易日的日期字符串。
+
+    任务在北京时间 05:30 运行，A 股尚未开盘，所以取的是上一个交易日的日线。
+    走日线而不是实时行情：实时接口在盘前返回的是上一交易日快照，一旦任务被
+    延迟到开盘后执行，同一个字段的含义就会从「昨日」变成「当日」。日线自带
+    日期，可以把口径显式标到表头上。
+
+    取不到数据时留空并继续——涨跌幅是辅助信息，不该阻断推送。
+    """
+    codes = [pick["code"] for group in groups for pick in group["picks"]]
+    if not codes:
+        return ""
+
+    trade_date = ""
+    try:
+        from data_provider.base import DataFetcherManager
+
+        manager = DataFetcherManager()
+    except Exception as exc:
+        logger.warning("行情管理器初始化失败，跳过昨日涨幅: %s", exc)
+        return ""
+
+    for group in groups:
+        for pick in group["picks"]:
+            pick["prev_change"] = ""
+            code = pick["code"]
+            try:
+                df, source = manager.get_daily_data(code, days=10)
+            except Exception as exc:
+                logger.debug("[昨日涨幅] %s 日线获取失败: %s", code, exc)
+                continue
+            if df is None or getattr(df, "empty", True):
+                continue
+            last = df.iloc[-1]
+            change = None
+            if "涨跌幅" in df.columns:
+                try:
+                    change = float(last["涨跌幅"])
+                except (TypeError, ValueError):
+                    change = None
+            if change is None and "收盘" in df.columns and len(df) >= 2:
+                try:
+                    prev_close = float(df.iloc[-2]["收盘"])
+                    close = float(last["收盘"])
+                    if prev_close:
+                        change = (close - prev_close) / prev_close * 100
+                except (TypeError, ValueError, ZeroDivisionError):
+                    change = None
+            if change is None:
+                continue
+            pick["prev_change"] = f"{change:+.2f}%"
+            if not trade_date and "日期" in df.columns:
+                trade_date = str(last["日期"])[:10]
+            logger.debug("[昨日涨幅] %s %s (%s)", code, pick["prev_change"], source)
+
+    return trade_date
 
 
 def _render_report(
     us_review: str,
     us_summary: str,
-    picks: List[Dict[str, str]],
+    groups: List[Dict[str, Any]],
     dropped: List[str],
     model_name: str,
     capital_flow: str = "",
+    trade_date: str = "",
 ) -> str:
-    """拼装推送正文。美股复盘在前，A 股推荐在后。"""
+    """拼装推送正文。美股复盘在前，按板块分组的 A 股推荐在后。"""
     from datetime import datetime
 
     lines: List[str] = []
@@ -220,27 +372,38 @@ def _render_report(
             lines.append("")
     lines.append("---")
     lines.append("")
-    lines.append(f"## 🇨🇳 关联 A 股推荐（{len(picks)} 只）")
+    total_picks = sum(len(group["picks"]) for group in groups)
+    lines.append(f"## 🇨🇳 关联 A 股推荐（{len(groups)} 个板块 / {total_picks} 只 · 仅看多）")
     lines.append("")
-    if picks:
-        lines.append("| # | 代码 | 名称 | 板块 | 对标美股 | 传导逻辑 |")
-        lines.append("|---|------|------|------|----------|----------|")
-        for position, pick in enumerate(picks, 1):
-            lines.append(
-                f"| {position} | {pick['code']} | {pick['name']} | {pick['sector']} "
-                f"| {pick['linkage']} | {pick['logic']} |"
-            )
+    if groups:
+        change_header = f"{trade_date} 涨幅" if trade_date else "上一交易日涨幅"
+        for group in groups:
+            lines.append(f"### 📈 {group['sector']}")
+            lines.append("")
+            lines.append(f"- **对标美股**: {group['linkage']}")
+            lines.append(f"- **传导逻辑**: {group['logic']}")
+            lines.append("")
+            lines.append(f"| 代码 | 名称 | {change_header} | 板块内定位 |")
+            lines.append("|------|------|----------|------------|")
+            for pick in group["picks"]:
+                change = pick.get("prev_change") or "-"
+                lines.append(
+                    f"| {pick['code']} | {pick['name']} | {change} | {pick['logic']} |"
+                )
+            lines.append("")
     else:
         lines.append("本次未产出通过代码校验的推荐标的。")
-    lines.append("")
+        lines.append("")
     if dropped:
-        lines.append(f"> 已剔除 {len(dropped)} 条未通过代码校验的候选：{('；'.join(dropped))[:200]}")
+        lines.append(f"> 已剔除 {len(dropped)} 条候选：{('；'.join(dropped))[:200]}")
         lines.append("")
     lines.append("---")
     lines.append("")
     lines.append(
         f"⚠️ **免责说明**：A 股推荐由大模型（{model_name}）基于美股复盘推理生成，"
         "属模型观点而非事实，代码已通过本地股票索引校验但基本面未经核实。"
+        "涨幅为上一交易日实际行情，仅作参考，不代表后续走势。"
+        "列表只保留看多方向，不代表其余板块应做空。"
         "跨市场传导存在时滞与失效可能，本内容不构成投资建议。"
     )
     return "\n".join(lines)
@@ -250,13 +413,29 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="美股复盘 + 关联 A 股推荐推送")
     parser.add_argument("--dry-run", action="store_true", help="只打印结果，不推送通知")
     parser.add_argument(
-        "--picks", type=int, default=DEFAULT_PICK_COUNT, help=f"推荐数量，默认 {DEFAULT_PICK_COUNT}"
+        "--sectors",
+        type=int,
+        default=DEFAULT_SECTOR_COUNT,
+        help=f"推荐的板块数量，每个板块 {PICKS_PER_SECTOR} 只，默认 {DEFAULT_SECTOR_COUNT}",
+    )
+    parser.add_argument(
+        "--picks",
+        type=int,
+        default=None,
+        help=(
+            "兼容旧参数：按总只数换算板块数（总数 // "
+            f"{PICKS_PER_SECTOR}）。同时给出 --sectors 时以 --sectors 为准"
+        ),
     )
     parser.add_argument(
         "--force-run", action="store_true", help="跳过美股交易日检查，强制执行"
     )
     args = parser.parse_args()
-    pick_count = max(1, min(30, int(args.picks)))
+    # --picks 是改版前的参数（总只数），workflow 里可能还在传，这里换算成板块数。
+    if args.picks is not None and args.sectors == DEFAULT_SECTOR_COUNT:
+        sector_count = max(1, min(10, int(args.picks) // PICKS_PER_SECTOR))
+    else:
+        sector_count = max(1, min(10, int(args.sectors)))
 
     from src.logging_config import setup_logging
 
@@ -345,9 +524,11 @@ def main() -> int:
         logger.warning("美股资金动向获取失败（不影响推荐）: %s", exc)
 
     # --- 3. LLM 生成 A 股推荐 ---
-    logger.info("请求 LLM 生成 %s 只关联 A 股 ...", pick_count)
+    logger.info(
+        "请求 LLM 生成 %s 个板块 × %s 只关联 A 股（仅看多）...", sector_count, PICKS_PER_SECTOR
+    )
     raw = analyzer.generate_text(
-        _build_prompt(us_review, pick_count, capital_flow),
+        _build_prompt(us_review, sector_count, capital_flow),
         max_tokens=4096,
         temperature=getattr(config, "llm_temperature", 0.7),
     )
@@ -356,23 +537,39 @@ def main() -> int:
         return 3
 
     parsed = _extract_json(raw)
-    if not parsed or not isinstance(parsed.get("picks"), list):
+    if not parsed:
         logger.error("LLM 输出无法解析为预期 JSON：%s", (raw or "")[:300])
         return 4
 
-    picks, dropped = _validate_picks(parsed.get("picks", []), pick_count)
-    logger.info("代码校验通过 %s 只，剔除 %s 条", len(picks), len(dropped))
+    sector_groups = _normalize_sector_groups(parsed)
+    if not sector_groups:
+        logger.error("LLM 输出中没有可用的板块分组：%s", (raw or "")[:300])
+        return 4
+
+    groups, dropped = _validate_picks(sector_groups, sector_count)
+    total_picks = sum(len(group["picks"]) for group in groups)
+    logger.info(
+        "校验通过 %s 个板块 / %s 只标的，剔除 %s 条", len(groups), total_picks, len(dropped)
+    )
     for note in dropped:
         logger.warning("剔除候选：%s", note)
+    if not groups:
+        logger.error("没有任何板块通过校验，终止")
+        return 4
+
+    # --- 3.5 补上一交易日涨幅 ---
+    trade_date = _attach_prev_change(groups)
+    logger.info("昨日涨幅基准交易日：%s", trade_date or "未取到")
 
     # --- 4. 组装并推送 ---
     report = _render_report(
         us_review=us_review,
         us_summary=str(parsed.get("us_summary", "")).strip(),
-        picks=picks,
+        groups=groups,
         dropped=dropped,
         model_name=getattr(config, "litellm_model", "") or "LLM",
         capital_flow=capital_flow,
+        trade_date=trade_date,
     )
 
     if args.dry_run:
@@ -384,7 +581,9 @@ def main() -> int:
     if not sent:
         logger.error("所有通知渠道均推送失败")
         return 5
-    logger.info("推送成功：美股复盘 + %s 只 A 股推荐", len(picks))
+    logger.info(
+        "推送成功：美股复盘 + %s 个板块 / %s 只 A 股推荐", len(groups), total_picks
+    )
     return 0
 
 
