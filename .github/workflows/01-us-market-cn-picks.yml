@@ -11,10 +11,10 @@ on:
     - cron: '30 21 * * 1-5'
   workflow_dispatch:
     inputs:
-      picks:
-        description: 'A股推荐数量'
+      sectors:
+        description: 'A股推荐板块数（每板块 3 只，仅看多）'
         required: false
-        default: '10'
+        default: '4'
         type: string
       dry_run:
         description: '只生成不推送'
@@ -195,11 +195,11 @@ jobs:
           TZ: Asia/Shanghai
         run: |
           echo "===== 美股复盘 + A股关联推荐 ====="
-          echo "推荐数量: ${{ inputs.picks || '10' }}"
+          echo "推荐板块数: ${{ inputs.sectors || '4' }}（每板块 3 只，仅看多）"
           echo "dry-run: ${{ inputs.dry_run || 'false' }}"
           echo "LLM 模型: ${LITELLM_MODEL:-未配置}"
           echo "通知渠道: 飞书=$([ -n "$FEISHU_WEBHOOK_URL" ] && echo 已配置 || echo 未配置)，自定义Webhook=$([ -n "$CUSTOM_WEBHOOK_URLS" ] && echo 已配置 || echo 未配置)"
-          ARGS="--picks ${{ inputs.picks || '10' }}"
+          ARGS="--sectors ${{ inputs.sectors || '4' }}"
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             ARGS="$ARGS --dry-run"
           fi
