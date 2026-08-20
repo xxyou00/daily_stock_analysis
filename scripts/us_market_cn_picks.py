@@ -287,59 +287,93 @@ def _validate_picks(
 def _attach_prev_change(groups: List[Dict[str, Any]]) -> str:
     """给每只标的补上最近一个交易日的涨跌幅，返回该交易日的日期字符串。
 
-    任务在北京时间 05:30 运行，A 股尚未开盘，所以取的是上一个交易日的日线。
-    走日线而不是实时行情：实时接口在盘前返回的是上一交易日快照，一旦任务被
-    延迟到开盘后执行，同一个字段的含义就会从「昨日」变成「当日」。日线自带
-    日期，可以把口径显式标到表头上。
+    用新浪的批量行情接口一次取回全部代码，而不是逐只走
+    ``DataFetcherManager.get_daily_data``。后者在 CI 环境下首选东财，实测每只
+    要等约 9 秒 ProtocolError 超时才熔断，接着切到 yfinance 用 ``.SS`` 后缀查
+    A 股同样失败，12 只标的耗掉两分钟最后仍然全空。新浪批量接口是项目里既有
+    的实时行情兜底源，一次请求返回所有代码，在 CI 中稳定可用。
+
+    任务在北京时间 05:30 运行，A 股尚未开盘，此时接口返回的最新价就是上一
+    交易日收盘价，算出来的正是上一交易日涨幅。返回值里的日期字段用来把口径
+    显式标到表头，这样即使任务被延迟到盘中执行也不会产生"昨日/当日"的歧义。
 
     取不到数据时留空并继续——涨跌幅是辅助信息，不该阻断推送。
     """
     codes = [pick["code"] for group in groups for pick in group["picks"]]
+    for group in groups:
+        for pick in group["picks"]:
+            pick["prev_change"] = ""
     if not codes:
         return ""
 
-    trade_date = ""
     try:
-        from data_provider.base import DataFetcherManager
+        import requests
 
-        manager = DataFetcherManager()
+        from data_provider.akshare_fetcher import (
+            SINA_REALTIME_ENDPOINT,
+            _to_sina_tx_symbol,
+        )
     except Exception as exc:
-        logger.warning("行情管理器初始化失败，跳过昨日涨幅: %s", exc)
+        logger.warning("行情依赖导入失败，跳过昨日涨幅: %s", exc)
+        return ""
+
+    symbol_to_code = {}
+    for code in codes:
+        try:
+            symbol_to_code[_to_sina_tx_symbol(code)] = code
+        except Exception:
+            continue
+    if not symbol_to_code:
+        return ""
+
+    url = f"http://{SINA_REALTIME_ENDPOINT}={','.join(symbol_to_code)}"
+    try:
+        response = requests.get(
+            url,
+            headers={"Referer": "http://finance.sina.com.cn", "User-Agent": "Mozilla/5.0"},
+            timeout=15,
+        )
+        response.encoding = "gbk"
+        raw = response.text
+    except Exception as exc:
+        logger.warning("[昨日涨幅] 新浪批量行情请求失败: %s", exc)
+        return ""
+
+    # 返回形如 var hq_str_sh600519="名称,今开,昨收,最新价,...,日期,时间";
+    changes: Dict[str, str] = {}
+    trade_date = ""
+    for line in raw.splitlines():
+        match = re.search(r'hq_str_([a-z]{2}\d{6})="([^"]*)"', line)
+        if not match:
+            continue
+        code = symbol_to_code.get(match.group(1))
+        fields = match.group(2).split(",")
+        if not code or len(fields) < 32:
+            continue
+        try:
+            # 字段顺序见 akshare_fetcher._get_stock_realtime_quote_sina：
+            # 2=昨收 3=最新价 30=日期
+            pre_close = float(fields[2])
+            price = float(fields[3])
+        except (TypeError, ValueError):
+            continue
+        if pre_close <= 0 or price <= 0:
+            continue
+        changes[code] = f"{(price - pre_close) / pre_close * 100:+.2f}%"
+        if not trade_date:
+            trade_date = fields[30].strip()
+
+    if not changes:
+        logger.warning("[昨日涨幅] 新浪返回中没有可用行情，共请求 %s 只", len(symbol_to_code))
         return ""
 
     for group in groups:
         for pick in group["picks"]:
-            pick["prev_change"] = ""
-            code = pick["code"]
-            try:
-                df, source = manager.get_daily_data(code, days=10)
-            except Exception as exc:
-                logger.debug("[昨日涨幅] %s 日线获取失败: %s", code, exc)
-                continue
-            if df is None or getattr(df, "empty", True):
-                continue
-            last = df.iloc[-1]
-            change = None
-            if "涨跌幅" in df.columns:
-                try:
-                    change = float(last["涨跌幅"])
-                except (TypeError, ValueError):
-                    change = None
-            if change is None and "收盘" in df.columns and len(df) >= 2:
-                try:
-                    prev_close = float(df.iloc[-2]["收盘"])
-                    close = float(last["收盘"])
-                    if prev_close:
-                        change = (close - prev_close) / prev_close * 100
-                except (TypeError, ValueError, ZeroDivisionError):
-                    change = None
-            if change is None:
-                continue
-            pick["prev_change"] = f"{change:+.2f}%"
-            if not trade_date and "日期" in df.columns:
-                trade_date = str(last["日期"])[:10]
-            logger.debug("[昨日涨幅] %s %s (%s)", code, pick["prev_change"], source)
+            pick["prev_change"] = changes.get(pick["code"], "")
 
+    logger.info(
+        "[昨日涨幅] 取到 %s/%s 只，基准交易日 %s", len(changes), len(codes), trade_date or "未知"
+    )
     return trade_date
 
 
