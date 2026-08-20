@@ -3661,6 +3661,67 @@ class SearchService:
 
         return None
 
+    # 正文里的日期形态：2024年12月25日 / 2026-05-17 / 2026/5/17 / 2026年5月
+    _CONTENT_ABSOLUTE_DATE_RE = re.compile(
+        r"(20\d{2})\s*[-/年\.]\s*(\d{1,2})(?:\s*[-/月\.]\s*(\d{1,2}))?"
+    )
+    # 相对表述一律视为近期，命中即认为在窗口内
+    _CONTENT_RELATIVE_DATE_RE = re.compile(
+        r"\d{1,2}\s*(?:天|日|小时|分钟)前|昨[天日]|今[天日]|刚刚|hours?\s+ago|days?\s+ago|minutes?\s+ago"
+    )
+
+    @classmethod
+    def _latest_content_date(cls, text: str) -> Optional[date]:
+        """识别文本里出现过的最新日期，用于兜底判断内容是否明显陈旧。
+
+        仅在结果没有 published_date、且已放宽 keep_unknown 时使用。搜索结果
+        缺少发布时间字段，但正文往往自带日期，可用来识别那些"页面近期更新、
+        内容却是历史事件"的条目。
+
+        取识别到的**最新**日期而非最早，宁可保留也不误杀：一篇近期文章即使
+        回顾历史事件，通常也会同时出现近期日期。只给出年月时按月末计算，
+        同样是为了避免把当月内容误判成超窗。未来年份（如正文里的预测年度）
+        会被忽略，防止被拉到窗口内。
+        """
+        if not text:
+            return None
+        if cls._CONTENT_RELATIVE_DATE_RE.search(text):
+            return datetime.now().date()
+
+        today = datetime.now().date()
+        upper_bound = today + timedelta(days=cls.FUTURE_TOLERANCE_DAYS)
+        best: Optional[date] = None
+        for match in cls._CONTENT_ABSOLUTE_DATE_RE.finditer(text):
+            year, month, day = match.group(1), match.group(2), match.group(3)
+            try:
+                year_i = int(year)
+                month_i = int(month)
+                if not 1 <= month_i <= 12:
+                    continue
+                if day:
+                    day_i = int(day)
+                    if not 1 <= day_i <= 31:
+                        continue
+                else:
+                    # 只有年月：按月末算，避免当月内容被判超窗
+                    if month_i == 12:
+                        day_i = 31
+                    else:
+                        day_i = (date(year_i, month_i + 1, 1) - timedelta(days=1)).day
+                candidate = date(year_i, month_i, day_i)
+            except ValueError:
+                continue
+            if candidate > upper_bound:
+                if day:
+                    # 明确写了年月日却落在未来：视为预测年份之类的干扰，忽略。
+                    continue
+                # 只有年月时按月末推算，当月内容会算出未来日期（例如 8/20 读到
+                # "2026年8月" 得到 8/31）。这类应判为当期而不是丢掉，收敛到今天。
+                candidate = today
+            if best is None or candidate > best:
+                best = candidate
+        return best
+
     @staticmethod
     def _provider_prefilters_freshness(provider) -> bool:
         """provider 是否已在服务端按时效过滤，可免除客户端 published_date 二次核验。
@@ -3699,11 +3760,21 @@ class SearchService:
         dropped_unknown = 0
         dropped_old = 0
         dropped_future = 0
+        dropped_stale_content = 0
 
         for item in response.results:
             published = self._normalize_news_publish_date(item.published_date)
             if published is None:
                 if keep_unknown:
+                    # 放宽 keep_unknown 后，无发布时间的结果全部会进来，其中可能夹带
+                    # 明显陈旧的内容——线上实例：一条「公司公告」页命中 7 天窗口，
+                    # 但正文是 2024-12-25 的证监会批复，被模型当成了当期利好。
+                    # 这里用正文里自带的日期做兜底判断，取识别到的最新日期，
+                    # 只有连最新日期都落在窗口之前才丢弃。
+                    inferred = self._latest_content_date(f"{item.title or ''} {item.snippet or ''}")
+                    if inferred is not None and inferred < earliest:
+                        dropped_stale_content += 1
+                        continue
                     filtered.append(
                         SearchResult(
                             title=item.title,
@@ -3743,9 +3814,10 @@ class SearchService:
             if len(filtered) >= max_results:
                 break
 
-        if dropped_unknown or dropped_old or dropped_future:
+        if dropped_unknown or dropped_old or dropped_future or dropped_stale_content:
             logger.info(
-                "[新闻过滤] %s: provider=%s, total=%s, kept=%s, drop_unknown=%s, drop_old=%s, drop_future=%s, window=[%s,%s]",
+                "[新闻过滤] %s: provider=%s, total=%s, kept=%s, drop_unknown=%s, drop_old=%s,"
+                " drop_future=%s, drop_stale_content=%s, window=[%s,%s]",
                 log_scope,
                 response.provider,
                 len(response.results),
@@ -3753,6 +3825,7 @@ class SearchService:
                 dropped_unknown,
                 dropped_old,
                 dropped_future,
+                dropped_stale_content,
                 earliest.isoformat(),
                 latest.isoformat(),
             )
