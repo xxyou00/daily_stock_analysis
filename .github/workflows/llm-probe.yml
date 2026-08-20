@@ -1,0 +1,116 @@
+name: LLM Probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      models:
+        description: '待探活模型（逗号分隔，litellm 形式，会自动剥离 openai/ 前缀）'
+        required: false
+        default: 'openai/z-ai/glm-5.2,openai/deepseek-ai/deepseek-v4-flash-0731,openai/moonshotai/kimi-k2.6'
+      timeout_s:
+        description: '单次请求超时秒数'
+        required: false
+        default: '120'
+      rounds:
+        description: '每个模型探活轮数（504 是容量问题，多轮更能反映真实可用率）'
+        required: false
+        default: '3'
+
+concurrency:
+  group: llm-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: 🔎 Probe NVIDIA gateway
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          BASE_URL: ${{ vars.OPENAI_BASE_URL }}
+          MODELS_INPUT: ${{ inputs.models }}
+          TIMEOUT_S: ${{ inputs.timeout_s }}
+          ROUNDS: ${{ inputs.rounds }}
+        run: |
+          set -uo pipefail
+          BASE="${BASE_URL:-https://integrate.api.nvidia.com/v1}"
+          BASE="${BASE%/}"
+
+          if [ -z "${OPENAI_API_KEY:-}" ]; then
+            echo "::error::OPENAI_API_KEY secret 为空"
+            exit 1
+          fi
+
+          echo "base_url=$BASE"
+          echo "key_len=${#OPENAI_API_KEY} key_prefix=${OPENAI_API_KEY:0:6}"
+
+          # ---------- 1. 网关模型清单 ----------
+          echo "== GET /models =="
+          MODELS_CODE=$(curl -sS -o /tmp/models.json -w '%{http_code}' \
+            --max-time 60 \
+            -H "Authorization: Bearer $OPENAI_API_KEY" \
+            "$BASE/models" || echo "000")
+          echo "http_code=$MODELS_CODE"
+          TOTAL=$(jq -r '(.data // []) | length' /tmp/models.json 2>/dev/null || echo 0)
+          echo "models_total=$TOTAL"
+
+          {
+            echo "## LLM Probe"
+            echo ""
+            echo "- base_url: \`$BASE\`"
+            echo "- \`GET /models\` → HTTP \`$MODELS_CODE\`，共 \`$TOTAL\` 个模型"
+            echo ""
+            echo "| 模型 | 在清单中 | 轮次 | HTTP | 耗时(s) | 结果 |"
+            echo "| --- | --- | --- | --- | --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # ---------- 2. 逐模型探活 ----------
+          IFS=',' read -ra RAW_MODELS <<< "$MODELS_INPUT"
+          for raw in "${RAW_MODELS[@]}"; do
+            m="$(echo "$raw" | tr -d '[:space:]')"
+            [ -z "$m" ] && continue
+            real="${m#openai/}"
+
+            if jq -e --arg id "$real" '(.data // []) | any(.id == $id)' /tmp/models.json >/dev/null 2>&1; then
+              LISTED="✅"
+            else
+              LISTED="❌"
+            fi
+            echo ""
+            echo "===== $real (listed=$LISTED) ====="
+
+            jq -n --arg model "$real" \
+              '{model:$model, messages:[{role:"user", content:"ping"}], max_tokens:16, temperature:1, stream:false}' \
+              > /tmp/req.json
+
+            for r in $(seq 1 "$ROUNDS"); do
+              OUT=$(curl -sS -o /tmp/resp.json -w '%{http_code} %{time_total}' \
+                --max-time "$TIMEOUT_S" \
+                -H "Authorization: Bearer $OPENAI_API_KEY" \
+                -H 'Content-Type: application/json' \
+                -H 'Accept: application/json' \
+                -d @/tmp/req.json \
+                "$BASE/chat/completions" 2>/tmp/curl.err || echo "000 0")
+              CODE="${OUT%% *}"
+              ELAPSED="${OUT##* }"
+
+              if [ "$CODE" = "200" ]; then
+                CONTENT=$(jq -r '(.choices[0].message.content // "") | tostring | .[0:80]' /tmp/resp.json 2>/dev/null)
+                USAGE=$(jq -c '.usage // {}' /tmp/resp.json 2>/dev/null)
+                RESULT="ok content=$(echo "$CONTENT" | tr -d '\n|') usage=$USAGE"
+              else
+                ERRMSG=$(jq -r '(.error.message // .detail // .title // .message // empty) | tostring' /tmp/resp.json 2>/dev/null)
+                [ -z "$ERRMSG" ] && ERRMSG=$(head -c 200 /tmp/resp.json 2>/dev/null | tr -d '\n|')
+                [ -z "$ERRMSG" ] && ERRMSG=$(head -c 200 /tmp/curl.err 2>/dev/null | tr -d '\n|')
+                RESULT="FAIL ${ERRMSG:-no-body}"
+              fi
+
+              echo "round=$r http=$CODE time=${ELAPSED}s $RESULT"
+              echo "| \`$real\` | $LISTED | $r | \`$CODE\` | $ELAPSED | ${RESULT} |" >> "$GITHUB_STEP_SUMMARY"
+            done
+          done
+
+          echo ""
+          echo "probe finished"
