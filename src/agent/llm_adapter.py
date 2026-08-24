@@ -107,6 +107,14 @@ _OPT_IN_THINKING_MODELS: Dict[str, dict] = {
     "deepseek-v4-flash": {
         "chat_template_kwargs": {"thinking": True, "reasoning_effort": "high"}
     },
+    # nemotron 用 enable_thinking（而非 thinking）并接受顶层 reasoning_budget。
+    # 该模型默认即开启思维链：实测不发 extra_body 时仍返回约 4000 字符
+    # reasoning_content，因此这里是显式确认而非启用。思维链使单次调用从约 5s
+    # 升到约 50-80s，若要走「兜底优先快」的路线可改为 enable_thinking: False。
+    "nemotron-3.5-lightning": {
+        "chat_template_kwargs": {"enable_thinking": True},
+        "reasoning_budget": 16384,
+    },
 }
 
 # Custom model pricing for models not in LiteLLM's built-in price list.
