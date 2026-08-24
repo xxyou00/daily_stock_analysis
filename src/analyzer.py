@@ -10,9 +10,11 @@ A股自选股智能分析系统 - AI分析层
 3. 解析 LLM 响应为结构化 AnalysisResult
 """
 
+import itertools
 import json
 import logging
 import math
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -105,6 +107,40 @@ from src.market_phase_prompt import format_market_phase_prompt_section
 from src.market_structure_prompt import format_market_structure_prompt_section
 
 logger = logging.getLogger(__name__)
+
+
+# 并发任务的模型轮转计数器。CPython 下 itertools.count 的 __next__ 是原子操作，
+# 多线程并发取值无需额外加锁。
+_CONCURRENT_MODEL_ROTATION_COUNTER = itertools.count()
+
+
+def _rotate_models_for_concurrent_tasks(models: List[str], max_workers: int) -> List[str]:
+    """并发分析时让各任务从不同模型起步，避开单一模型的限流桶。
+
+    NVIDIA 网关的限流按模型独立计算：多个并发任务同时打主模型会集中触发 429，
+    而错开起点后每个任务先命中不同模型，且旋转后的其余模型仍构成完整 fallback 链。
+
+    仅在 max_workers > 1 且候选模型多于 1 个时生效，并由环境变量
+    ``LLM_CONCURRENT_MODEL_ROTATION`` 控制（默认关闭，保持原有主模型优先行为）。
+    """
+    if len(models) < 2 or max_workers <= 1:
+        return models
+    if os.getenv('LLM_CONCURRENT_MODEL_ROTATION', 'false').strip().lower() != 'true':
+        return models
+
+    offset = next(_CONCURRENT_MODEL_ROTATION_COUNTER) % len(models)
+    if offset == 0:
+        return models
+
+    rotated = models[offset:] + models[:offset]
+    logger.info(
+        "[LLM并发分散] max_workers=%d offset=%d 首选模型=%s 候选链=%s",
+        max_workers,
+        offset,
+        rotated[0],
+        " -> ".join(rotated),
+    )
+    return rotated
 
 
 def _localized_text(language: Any, *, en: str, zh: str, ko: str) -> str:
@@ -3122,6 +3158,10 @@ class GeminiAnalyzer:
 
         models_to_try = [config.litellm_model] + (config.litellm_fallback_models or [])
         models_to_try = [m for m in models_to_try if m]
+        models_to_try = _rotate_models_for_concurrent_tasks(
+            models_to_try,
+            getattr(config, 'max_workers', 1),
+        )
 
         use_channel_router = self._has_channel_config(config)
 
