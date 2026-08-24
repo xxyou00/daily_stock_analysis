@@ -2771,8 +2771,12 @@ class TestMarketAnalyzerBypassFix:
             template_review.assert_not_called()
             mock_record_llm_run.assert_called_once()
 
-    def test_market_review_uses_8192_max_tokens(self):
-        """generate_market_review() should request a larger output budget to avoid truncation."""
+    def test_market_review_uses_16384_max_tokens(self):
+        """generate_market_review() should request a larger output budget to avoid truncation.
+
+        额度在 2026-08 从 8192 翻倍到 16384：思维链模型（minimax-m3 / kimi-k3 /
+        nemotron）的 reasoning_content 与正文共享同一 max_tokens 预算。
+        """
         from src.market_analyzer import MarketOverview, MarketIndex
 
         ma = self._make_market_analyzer_with_mock_generate_text(return_value="复盘结果")
@@ -2794,7 +2798,7 @@ class TestMarketAnalyzerBypassFix:
         assert isinstance(result, str) and len(result) > 0
         ma.analyzer.generate_text.assert_called_once()
         _, kwargs = ma.analyzer.generate_text.call_args
-        assert kwargs["max_tokens"] == 8192
+        assert kwargs["max_tokens"] == 16384
         assert kwargs["temperature"] == 0.7
 
     def test_generate_template_review_uses_english_shell_for_cn_when_report_language_is_en(self):
