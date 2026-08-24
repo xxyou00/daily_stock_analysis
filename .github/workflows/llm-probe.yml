@@ -1,0 +1,103 @@
+name: LLM Probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      models:
+        description: '待探活模型（逗号分隔，litellm 形式，会自动剥离 openai/ 前缀）'
+        required: false
+        default: 'openai/minimaxai/minimax-m3,openai/moonshotai/kimi-k3,openai/deepseek-ai/deepseek-v4-flash-0731,openai/z-ai/glm-5.2'
+      timeout_s:
+        description: '单次请求超时秒数'
+        required: false
+        default: '180'
+
+concurrency:
+  group: llm-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: 🔎 Probe NVIDIA gateway
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          BASE_URL: ${{ vars.OPENAI_BASE_URL }}
+          MODELS_INPUT: ${{ inputs.models }}
+          TIMEOUT_S: ${{ inputs.timeout_s }}
+        run: |
+          set -uo pipefail
+          BASE="${BASE_URL:-https://integrate.api.nvidia.com/v1}"
+          BASE="${BASE%/}"
+
+          MODELS_CODE=$(curl -sS -o /tmp/models.json -w '%{http_code}' --max-time 60 \
+            -H "Authorization: Bearer $OPENAI_API_KEY" "$BASE/models" || echo "000")
+          TOTAL=$(jq -r '(.data // []) | length' /tmp/models.json 2>/dev/null || echo 0)
+          echo "GET /models http_code=$MODELS_CODE models_total=$TOTAL"
+
+          echo "== /models 条目字段结构（看是否暴露 EOL / lifecycle）=="
+          jq -c '(.data // [])[0]' /tmp/models.json 2>/dev/null
+
+          echo "== 网关全部模型 ID =="
+          jq -r '(.data // [])[].id' /tmp/models.json 2>/dev/null | sort
+
+          {
+            echo "## LLM Probe"
+            echo ""
+            echo "- \`GET /models\` → HTTP \`$MODELS_CODE\`，共 \`$TOTAL\` 个模型"
+            echo ""
+            echo "| 模型 | 清单 | HTTP | 耗时(s) | finish | content长度 | 判定 |"
+            echo "| --- | --- | --- | --- | --- | --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          IFS=',' read -ra RAW_MODELS <<< "$MODELS_INPUT"
+          for raw in "${RAW_MODELS[@]}"; do
+            m="$(echo "$raw" | tr -d '[:space:]')"
+            [ -z "$m" ] && continue
+            real="${m#openai/}"
+
+            if jq -e --arg id "$real" '(.data // []) | any(.id == $id)' /tmp/models.json >/dev/null 2>&1; then
+              LISTED="✅"
+            else
+              LISTED="❌"
+            fi
+            echo ""
+            echo "########## $real (listed=$LISTED) ##########"
+
+            jq -n --arg model "$real" \
+              '{model:$model, messages:[{role:"user", content:"用一句话说明沪深两市今日成交额环比变化的意义。"}],
+                temperature:1, top_p:0.95, max_tokens:8192, stream:false}' > /tmp/req.json
+
+            OUT=$(curl -sS -o /tmp/resp.json -w '%{http_code} %{time_total}' --max-time "$TIMEOUT_S" \
+              -H "Authorization: Bearer $OPENAI_API_KEY" -H 'Content-Type: application/json' \
+              -d @/tmp/req.json "$BASE/chat/completions" 2>/tmp/curl.err || echo "000 0")
+            CODE="${OUT%% *}"; ELAPSED="${OUT##* }"
+
+            FINISH="-"; CLEN="-"; VERDICT=""
+            if [ "$CODE" = "200" ]; then
+              FINISH=$(jq -r '.choices[0].finish_reason // "-"' /tmp/resp.json 2>/dev/null)
+              CLEN=$(jq -r '(.choices[0].message.content // "") | tostring | length' /tmp/resp.json 2>/dev/null)
+              VERDICT="可用"
+              echo "http=200 time=${ELAPSED}s finish=$FINISH content_len=$CLEN"
+              echo "preview: $(jq -r '(.choices[0].message.content // "") | tostring | .[0:70]' /tmp/resp.json | tr -d '\n|')"
+            else
+              ERRMSG=$(jq -r '(.error.message // .detail // .title // .message // empty) | tostring' /tmp/resp.json 2>/dev/null)
+              [ -z "$ERRMSG" ] && ERRMSG=$(head -c 300 /tmp/resp.json | tr -d '\n|')
+              case "$CODE" in
+                410) VERDICT="⚠️ 已 EOL 下线" ;;
+                404) VERDICT="账户无权" ;;
+                429) VERDICT="限流" ;;
+                5*)  VERDICT="服务端错误" ;;
+                *)   VERDICT="失败" ;;
+              esac
+              VERDICT="$VERDICT: ${ERRMSG:-no-body}"
+              echo "http=$CODE time=${ELAPSED}s $VERDICT"
+            fi
+            echo "| \`$real\` | $LISTED | \`$CODE\` | $ELAPSED | $FINISH | $CLEN | $VERDICT |" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+          echo ""
+          echo "probe finished"
