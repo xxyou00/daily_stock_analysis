@@ -23,6 +23,11 @@ on:
         required: false
         default: false
         type: boolean
+      no_notify:
+        description: '不发送推送通知（用于验证运行，不打扰飞书群）'
+        required: false
+        default: false
+        type: boolean
 
 # 并发控制：同一时间只运行一个分析任务
 concurrency:
@@ -656,13 +661,19 @@ jobs:
             echo "⚡ 已启用强制运行模式（跳过交易日检查）"
           fi
 
+          NO_NOTIFY_ARG=""
+          if [ "${{ github.event.inputs.no_notify }}" = "true" ]; then
+            NO_NOTIFY_ARG="--no-notify"
+            echo "🔇 已启用 --no-notify：本次为验证运行，不发送推送"
+          fi
+
           # 执行分析
           if [ "$MODE" = "market-only" ]; then
-            python main.py --market-review $FORCE_RUN_ARG
+            python main.py --market-review $FORCE_RUN_ARG $NO_NOTIFY_ARG
           elif [ "$MODE" = "stocks-only" ]; then
-            python main.py --no-market-review $FORCE_RUN_ARG
+            python main.py --no-market-review $FORCE_RUN_ARG $NO_NOTIFY_ARG
           else
-            python main.py $FORCE_RUN_ARG
+            python main.py $FORCE_RUN_ARG $NO_NOTIFY_ARG
           fi
       
       - name: 上传分析报告
