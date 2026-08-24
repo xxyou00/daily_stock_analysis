@@ -1,0 +1,111 @@
+name: LLM Probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: '模型 ID（网关原始 ID，不带 openai/ 前缀）'
+        required: false
+        default: 'deepseek-ai/deepseek-v4-flash-0731'
+      timeout_s:
+        description: '单次请求超时秒数'
+        required: false
+        default: '300'
+
+concurrency:
+  group: llm-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: 🔎 JSON 遵循度 × thinking × max_tokens 矩阵
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          BASE_URL: ${{ vars.OPENAI_BASE_URL }}
+          MODEL: ${{ inputs.model }}
+          TIMEOUT_S: ${{ inputs.timeout_s }}
+        run: |
+          set -uo pipefail
+          BASE="${BASE_URL:-https://integrate.api.nvidia.com/v1}"; BASE="${BASE%/}"
+
+          # 模拟个股分析的 JSON 输出约束
+          PROMPT='请分析中钨高新(000657)当前的技术面与基本面，并严格以 JSON 输出，不要任何额外文字或 markdown 代码块。字段：trend(string 趋势判断), score(number 0-100 评分), reason(string 不少于150字的理由), risks(array of string 至少3条风险)。'
+
+          {
+            echo "## JSON 遵循度矩阵 — \`$MODEL\`"
+            echo ""
+            echo "| # | thinking 配置 | max_tokens | HTTP | 耗时(s) | finish | reasoning长度 | content长度 | JSON 可解析 | 字段完整 |"
+            echo "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          run_case () {
+            local idx="$1" label="$2" mt="$3" extra="$4"
+            echo ""
+            echo "########## case $idx: $label / max_tokens=$mt ##########"
+            echo "extra_body=$extra"
+
+            if [ "$extra" = "none" ]; then
+              jq -n --arg model "$MODEL" --arg p "$PROMPT" --argjson mt "$mt" \
+                '{model:$model, messages:[{role:"user",content:$p}],
+                  temperature:1, top_p:0.95, max_tokens:$mt, stream:false}' > /tmp/req.json
+            else
+              jq -n --arg model "$MODEL" --arg p "$PROMPT" --argjson mt "$mt" --argjson extra "$extra" \
+                '{model:$model, messages:[{role:"user",content:$p}],
+                  temperature:1, top_p:0.95, max_tokens:$mt, stream:false} + $extra' > /tmp/req.json
+            fi
+
+            OUT=$(curl -sS -o /tmp/resp.json -w '%{http_code} %{time_total}' --max-time "$TIMEOUT_S" \
+              -H "Authorization: Bearer $OPENAI_API_KEY" -H 'Content-Type: application/json' \
+              -d @/tmp/req.json "$BASE/chat/completions" 2>/tmp/curl.err || echo "000 0")
+            local CODE="${OUT%% *}" ELAPSED="${OUT##* }"
+            local FINISH="-" CLEN="-" RLEN="-" PARSE="-" FIELDS="-"
+
+            if [ "$CODE" = "200" ]; then
+              FINISH=$(jq -r '.choices[0].finish_reason // "-"' /tmp/resp.json)
+              CLEN=$(jq -r '(.choices[0].message.content // "")|tostring|length' /tmp/resp.json)
+              RLEN=$(jq -r '(.choices[0].message.reasoning_content // .choices[0].message.reasoning // "")|tostring|length' /tmp/resp.json)
+              jq -r '(.choices[0].message.content // "")' /tmp/resp.json > /tmp/content.txt
+              # 容忍 ```json 包裹
+              sed -e 's/^[[:space:]]*```json[[:space:]]*//' -e 's/^[[:space:]]*```[[:space:]]*//' -e 's/```[[:space:]]*$//' /tmp/content.txt > /tmp/content_clean.txt
+              if jq -e . /tmp/content_clean.txt >/dev/null 2>&1; then
+                PARSE="✅"
+                if jq -e 'has("trend") and has("score") and has("reason") and has("risks")' /tmp/content_clean.txt >/dev/null 2>&1; then
+                  FIELDS="✅ 4/4"
+                else
+                  FIELDS="⚠️ $(jq -r '[keys[]]|join(",")' /tmp/content_clean.txt 2>/dev/null | head -c 60)"
+                fi
+              else
+                PARSE="❌"
+                FIELDS="-"
+              fi
+              echo "http=200 time=${ELAPSED}s finish=$FINISH reasoning_len=$RLEN content_len=$CLEN json=$PARSE fields=$FIELDS"
+              echo "usage: $(jq -c '.usage // {}' /tmp/resp.json)"
+              echo "content 头 200 字: $(head -c 200 /tmp/content.txt | tr -d '\n|')"
+              echo "content 尾 120 字: $(tail -c 120 /tmp/content.txt | tr -d '\n|')"
+            else
+              local ERRMSG
+              ERRMSG=$(jq -r '(.error.message // .detail // .title // .message // empty)|tostring' /tmp/resp.json 2>/dev/null)
+              [ -z "$ERRMSG" ] && ERRMSG=$(head -c 300 /tmp/resp.json | tr -d '\n|')
+              PARSE="FAIL"; FIELDS="${ERRMSG:-no-body}"
+              echo "http=$CODE time=${ELAPSED}s $ERRMSG"
+            fi
+
+            echo "| $idx | $label | $mt | \`$CODE\` | $ELAPSED | $FINISH | $RLEN | $CLEN | $PARSE | $FIELDS |" >> "$GITHUB_STEP_SUMMARY"
+            sleep 8
+          }
+
+          # 1) 现状：不发 thinking 参数，项目当前的 max_tokens
+          run_case 1 "不发 thinking（现状）" 8192 none
+          # 2) 用户示例：NVIDIA/vLLM 风格 thinking + 大额度
+          run_case 2 "chat_template_kwargs thinking=true effort=high" 16384 '{"chat_template_kwargs":{"thinking":true,"reasoning_effort":"high"}}'
+          # 3) 显式关闭 thinking，沿用项目额度
+          run_case 3 "chat_template_kwargs thinking=false" 8192 '{"chat_template_kwargs":{"thinking":false}}'
+          # 4) DeepSeek 官方风格（项目 _OPT_IN_THINKING_MODELS 现有格式），验证网关是否接受
+          run_case 4 "thinking.type=enabled（项目现有格式）" 8192 '{"thinking":{"type":"enabled"}}'
+
+          echo ""
+          echo "probe finished"
