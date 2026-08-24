@@ -531,6 +531,9 @@ jobs:
           # ==========================================
           LOG_LEVEL: INFO
           MAX_WORKERS: ${{ vars.MAX_WORKERS || secrets.MAX_WORKERS || '1' }}
+          # 并发分析时让各任务从不同模型起步，避开 NVIDIA 网关 per-model 限流（默认 false）。
+          # 仅在 MAX_WORKERS > 1 且配置了 fallback 模型时生效；旋转后其余模型仍是完整 fallback 链。
+          LLM_CONCURRENT_MODEL_ROTATION: ${{ vars.LLM_CONCURRENT_MODEL_ROTATION || secrets.LLM_CONCURRENT_MODEL_ROTATION || 'false' }}
           # 筹码分布：默认 false（云端接口不稳定）；需启用时在 Settings → Variables 添加 ENABLE_CHIP_DISTRIBUTION=true
           ENABLE_CHIP_DISTRIBUTION: ${{ vars.ENABLE_CHIP_DISTRIBUTION || secrets.ENABLE_CHIP_DISTRIBUTION || 'false' }}
           # 筹码接口同源重试次数（默认 1 = 不重试，保持上游行为；建议 3）
