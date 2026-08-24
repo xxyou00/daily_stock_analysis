@@ -3151,7 +3151,7 @@ class GeminiAnalyzer:
         max_tokens = (
             generation_config.get('max_output_tokens')
             or generation_config.get('max_tokens')
-            or 8192
+            or 16384
         )
         requested_temperature = generation_config.get('temperature', 0.7)
         requested_timeout = generation_config.get("timeout")
@@ -3582,9 +3582,12 @@ class GeminiAnalyzer:
                 logger.debug(f"=== 完整 Prompt ({len(prompt)}字符) ===\n{prompt}\n=== End Prompt ===")
 
             # 设置生成配置
+            # max_output_tokens 从 8192 翻倍到 16384：思维链模型（minimax-m3、
+            # kimi-k3、nemotron）的 reasoning_content 与正文共享该额度，8192 下
+            # 复杂个股 prompt 存在被截断进而 JSON 解析失败的风险。
             generation_config = {
                 "temperature": config.llm_temperature,
-                "max_output_tokens": 8192,
+                "max_output_tokens": 16384,
             }
 
             logger.info(f"[LLM调用] 开始调用 {model_name}...")
