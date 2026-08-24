@@ -131,7 +131,7 @@ class MarketAnalyzer:
     # 进入 prompt 的市场新闻条数上限，_build_review_prompt 直接引用本常量。
     # 资讯池接入后可用条目从个位数涨到几百条（17 个源），窗口太窄会浪费素材，
     # 因此从 6 提到 12。按每条 title 90 + snippet 220 估算约 3.7K 字符，
-    # 相对 8192 的 max_tokens 仍有充足余量。
+    # 相对 16384 的 max_tokens 仍有充足余量。
     _MARKET_NEWS_PROMPT_SLOTS = 12
     # 上述槽位中预留给搜索结果的条数，其余优先给本地资讯池。
     # 刻意不随总量翻倍：搜索结果没有发布时间、来源不可控，多给名额只是把
@@ -711,7 +711,7 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 model=getattr(self.config, "litellm_model", None),
                 call_type="market_review",
             )
-            review = self.analyzer.generate_text(prompt, max_tokens=8192, temperature=0.7)
+            review = self.analyzer.generate_text(prompt, max_tokens=16384, temperature=0.7)
         except Exception as exc:
             record_llm_run(
                 success=False,
