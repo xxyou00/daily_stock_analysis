@@ -561,9 +561,12 @@ def main() -> int:
     logger.info(
         "请求 LLM 生成 %s 个板块 × %s 只关联 A 股（仅看多）...", sector_count, PICKS_PER_SECTOR
     )
+    # max_tokens 从 4096 翻倍到 8192：思维链模型的 reasoning_content 与正文
+    # 共享该额度（实测 nemotron 单次思维链可达约 4000 字符），4096 下板块数
+    # 较多时存在正文被截断的风险。
     raw = analyzer.generate_text(
         _build_prompt(us_review, sector_count, capital_flow),
-        max_tokens=4096,
+        max_tokens=8192,
         temperature=getattr(config, "llm_temperature", 0.7),
     )
     if not raw:
