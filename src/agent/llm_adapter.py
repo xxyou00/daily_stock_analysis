@@ -98,8 +98,15 @@ class LLMResponse:
 _AUTO_THINKING_MODELS: List[str] = ["deepseek-reasoner", "deepseek-r1", "qwq"]
 
 # Models that need explicit opt-in via extra_body; payload decoupled from model name.
+# 注意不同供应商的激活格式不同：DeepSeek 官方 API 用 {"thinking": {"type": "enabled"}}，
+# 而 NVIDIA 网关（vLLM 风格）用 chat_template_kwargs 并支持 reasoning_effort 档位。
+# 实测两种格式 NVIDIA 网关都接受，这里对 deepseek-v4-flash 采用官方示例给出的
+# NVIDIA 形式，以便显式指定 reasoning_effort。
 _OPT_IN_THINKING_MODELS: Dict[str, dict] = {
     "deepseek-chat": {"thinking": {"type": "enabled"}},
+    "deepseek-v4-flash": {
+        "chat_template_kwargs": {"thinking": True, "reasoning_effort": "high"}
+    },
 }
 
 # Custom model pricing for models not in LiteLLM's built-in price list.
