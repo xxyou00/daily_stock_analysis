@@ -120,6 +120,10 @@ def _rotate_models_for_concurrent_tasks(models: List[str], max_workers: int) -> 
     NVIDIA 网关的限流按模型独立计算：多个并发任务同时打主模型会集中触发 429，
     而错开起点后每个任务先命中不同模型，且旋转后的其余模型仍构成完整 fallback 链。
 
+    轮转池只覆盖前 ``max_workers`` 个候选模型：并发度决定了最多需要几个互不
+    冲突的起点，超出该范围的尾部模型保持纯兜底语义，永远不会被选为首选。
+    这样可以把「能力较弱但可用」的模型放在链尾，只在前面全部失败时才启用。
+
     仅在 max_workers > 1 且候选模型多于 1 个时生效，并由环境变量
     ``LLM_CONCURRENT_MODEL_ROTATION`` 控制（默认关闭，保持原有主模型优先行为）。
     """
@@ -128,7 +132,8 @@ def _rotate_models_for_concurrent_tasks(models: List[str], max_workers: int) -> 
     if os.getenv('LLM_CONCURRENT_MODEL_ROTATION', 'false').strip().lower() != 'true':
         return models
 
-    offset = next(_CONCURRENT_MODEL_ROTATION_COUNTER) % len(models)
+    rotation_pool = min(max_workers, len(models))
+    offset = next(_CONCURRENT_MODEL_ROTATION_COUNTER) % rotation_pool
     if offset == 0:
         return models
 
