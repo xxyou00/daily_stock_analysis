@@ -58,8 +58,9 @@ jobs:
           EOP
 
           # 复刻 src/analyzer.py 的 _load_analysis_json_candidate + _fix_json_string 判定链
-          # heredoc 会保留 YAML 块缩进，写成 .raw 后用 sed 去掉固定前缀再交给 python
-          cat > /tmp/judge.raw <<'PYEOF'
+          # 注意：YAML 的 | block scalar 已剥掉块缩进，heredoc 内容落地即为标准
+          # Python 缩进，不可再做 sed 去缩进（会把深层缩进削错）。
+          cat > /tmp/judge.py <<'PYEOF'
           import json, re, sys
           from json_repair import repair_json
 
@@ -121,8 +122,7 @@ jobs:
           print(f"VERDICT=VALID repaired={repaired} top_missing={miss or 'none'} "
                 f"nested_ok={nest_ok} summary_len={summary_len}")
           PYEOF
-          sed 's/^          //' /tmp/judge.raw > /tmp/judge.py
-          python -c "import ast,sys; ast.parse(open('/tmp/judge.py').read()); print('judge.py 语法 OK')"
+          python -c "import ast; ast.parse(open('/tmp/judge.py').read()); print('judge.py 语法 OK')"
 
           {
             echo "## 用项目 JSON 修复链判定（含 json_repair）"
@@ -167,6 +167,8 @@ jobs:
           done
 
           echo ""; echo "probe finished"
+          # 探活为诊断用途，个别模型失败不应让 step 失败
+          exit 0
 
       - uses: actions/upload-artifact@v6
         if: always()
