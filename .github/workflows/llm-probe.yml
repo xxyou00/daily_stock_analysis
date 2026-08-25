@@ -1,0 +1,120 @@
+name: LLM Probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      models:
+        description: '模型 ID 列表（网关原始 ID，逗号分隔）'
+        required: false
+        default: 'meta/muse-glimmer-30b,minimaxai/minimax-m3,moonshotai/kimi-k3,deepseek-ai/deepseek-v4-flash-0731,nvidia/nemotron-3.5-lightning-30b-a3b'
+      max_tokens:
+        description: 'max_tokens（与项目主链路一致）'
+        required: false
+        default: '16384'
+      timeout_s:
+        required: false
+        default: '400'
+
+concurrency:
+  group: llm-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: 🔎 嵌套 JSON schema 遵循度（贴近生产约束）
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          BASE_URL: ${{ vars.OPENAI_BASE_URL }}
+          MODELS: ${{ inputs.models }}
+          MT: ${{ inputs.max_tokens }}
+          TIMEOUT_S: ${{ inputs.timeout_s }}
+        run: |
+          set -uo pipefail
+          BASE="${BASE_URL:-https://integrate.api.nvidia.com/v1}"; BASE="${BASE%/}"
+
+          curl -sS -o /tmp/models.json --max-time 60 \
+            -H "Authorization: Bearer $OPENAI_API_KEY" "$BASE/models" >/dev/null || true
+
+          # 贴近 src/analyzer.py 校验器的真实必填项（含三层嵌套）
+          read -r -d '' PROMPT <<'EOP' || true
+          请分析中钨高新(000657)，严格只输出一个 JSON 对象，不要 markdown 代码块、不要任何解释文字。必须包含以下全部字段，嵌套层级不得省略：
+          {
+            "stock_name": "字符串",
+            "sentiment_score": 0-100 的数字,
+            "trend_prediction": "字符串",
+            "operation_advice": "字符串",
+            "decision_type": "buy 或 hold 或 watch 或 sell",
+            "analysis_summary": "不少于150字的中文分析",
+            "stop_loss": "字符串价位或区间",
+            "risk_alerts": ["至少3条风险"],
+            "dashboard": {
+              "core_conclusion": { "one_sentence": "一句话结论" },
+              "intelligence": { "risk_alerts": ["至少2条情报风险"] },
+              "battle_plan": { "sniper_points": { "entry": "入场点", "target": "目标位" } }
+            }
+          }
+          EOP
+
+          {
+            echo "## 嵌套 JSON schema 遵循度（max_tokens=$MT）"
+            echo ""
+            echo "| 模型 | 清单 | HTTP | 耗时(s) | finish | reasoning | content | JSON | 顶层必填 | 嵌套必填 |"
+            echo "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          IFS=',' read -ra ARR <<< "$MODELS"
+          for raw in "${ARR[@]}"; do
+            M="$(echo "$raw" | tr -d '[:space:]')"
+            [ -z "$M" ] && continue
+            if jq -e --arg id "$M" '(.data // []) | any(.id == $id)' /tmp/models.json >/dev/null 2>&1; then
+              LISTED="✅"; else LISTED="❌"; fi
+
+            echo ""
+            echo "########## $M (listed=$LISTED) ##########"
+            jq -n --arg model "$M" --arg p "$PROMPT" --argjson mt "$MT" \
+              '{model:$model, messages:[{role:"user",content:$p}],
+                temperature:1, top_p:0.95, max_tokens:$mt, stream:false}' > /tmp/req.json
+
+            OUT=$(curl -sS -o /tmp/resp.json -w '%{http_code} %{time_total}' --max-time "$TIMEOUT_S" \
+              -H "Authorization: Bearer $OPENAI_API_KEY" -H 'Content-Type: application/json' \
+              -d @/tmp/req.json "$BASE/chat/completions" 2>/tmp/err.txt || echo "000 0")
+            CODE="${OUT%% *}"; ELAPSED="${OUT##* }"
+            FINISH="-"; CLEN="-"; RLEN="-"; PARSE="-"; TOP="-"; NEST="-"
+
+            if [ "$CODE" = "200" ]; then
+              FINISH=$(jq -r '.choices[0].finish_reason // "-"' /tmp/resp.json)
+              CLEN=$(jq -r '(.choices[0].message.content // "")|tostring|length' /tmp/resp.json)
+              RLEN=$(jq -r '(.choices[0].message.reasoning_content // .choices[0].message.reasoning // "")|tostring|length' /tmp/resp.json)
+              jq -r '(.choices[0].message.content // "")' /tmp/resp.json > /tmp/c.txt
+              sed -e 's/^[[:space:]]*```json[[:space:]]*//' -e 's/^[[:space:]]*```[[:space:]]*//' -e 's/```[[:space:]]*$//' /tmp/c.txt > /tmp/cc.txt
+              if jq -e . /tmp/cc.txt >/dev/null 2>&1; then
+                PARSE="✅"
+                if jq -e 'has("stock_name") and has("sentiment_score") and has("operation_advice") and has("analysis_summary") and has("decision_type") and has("stop_loss") and (.risk_alerts|type=="array")' /tmp/cc.txt >/dev/null 2>&1; then
+                  TOP="✅ 7/7"; else TOP="❌ 缺项"; fi
+                if jq -e '(.dashboard.core_conclusion.one_sentence|type=="string") and (.dashboard.intelligence.risk_alerts|type=="array") and (.dashboard.battle_plan.sniper_points|type=="object")' /tmp/cc.txt >/dev/null 2>&1; then
+                  NEST="✅ 3/3"; else NEST="❌ $(jq -c '.dashboard // "无 dashboard"' /tmp/cc.txt 2>/dev/null | head -c 70)"; fi
+                echo "summary 字数: $(jq -r '(.analysis_summary // "")|length' /tmp/cc.txt 2>/dev/null)"
+              else
+                PARSE="❌ 不可解析"
+                echo "原始输出头 200: $(head -c 200 /tmp/c.txt | tr -d '\n|')"
+                echo "原始输出尾 120: $(tail -c 120 /tmp/c.txt | tr -d '\n|')"
+              fi
+              echo "http=200 time=${ELAPSED}s finish=$FINISH reasoning=$RLEN content=$CLEN json=$PARSE top=$TOP nest=$NEST"
+              echo "usage: $(jq -c '.usage // {}' /tmp/resp.json)"
+            else
+              ERR=$(jq -r '(.error.message // .detail // .title // .message // empty)|tostring' /tmp/resp.json 2>/dev/null)
+              [ -z "$ERR" ] && ERR=$(head -c 250 /tmp/resp.json | tr -d '\n|')
+              PARSE="FAIL"; TOP="${ERR:-no-body}"
+              echo "http=$CODE time=${ELAPSED}s $ERR"
+            fi
+
+            echo "| \`$M\` | $LISTED | \`$CODE\` | $ELAPSED | $FINISH | $RLEN | $CLEN | $PARSE | $TOP | $NEST |" >> "$GITHUB_STEP_SUMMARY"
+            sleep 10
+          done
+
+          echo ""
+          echo "probe finished"
