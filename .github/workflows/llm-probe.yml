@@ -35,6 +35,9 @@ jobs:
           MODELS: ${{ inputs.models }}
           ROUNDS: ${{ inputs.rounds }}
         run: |
+          # 显式关闭 errexit：本 step 是诊断用途，单个模型/单轮失败要继续跑完矩阵。
+          # Actions 默认注入 -e -o pipefail，这里覆盖掉 -e。
+          set +e
           set -uo pipefail
           BASE="${BASE_URL:-https://integrate.api.nvidia.com/v1}"; BASE="${BASE%/}"
 
@@ -155,12 +158,15 @@ jobs:
               echo "round=$r http=200 time=${ELAPSED}s reasoning=$RLEN content=$CLEN :: $V"
               echo "  头80: $(head -c 80 "/tmp/out_${r}.txt" | tr -d '\n|')"
 
-              VERDICT=$(echo "$V" | grep -oE 'VERDICT=[A-Z]+' | cut -d= -f2)
-              REP=$(echo "$V" | grep -oE 'repaired=[A-Za-z]+' | cut -d= -f2)
-              MISS=$(echo "$V" | grep -oE 'top_missing=[^ ]+' | cut -d= -f2)
-              NEST=$(echo "$V" | grep -oE 'nested_ok=[A-Za-z]+' | cut -d= -f2)
-              SLEN=$(echo "$V" | grep -oE 'summary_len=[0-9]+' | cut -d= -f2)
-              REASON=$(echo "$V" | grep -oE 'reason=.*' | head -c 60)
+              # Actions 默认 shell 带 -e，叠加 pipefail 后 grep 无匹配（返回 1）会直接
+              # 终止 step。VALID 时没有 reason=、INVALID 时没有 repaired=/summary_len=，
+              # 因此每个抽取都必须兜住失败。
+              VERDICT=$(echo "$V" | grep -oE 'VERDICT=[A-Z]+' | cut -d= -f2 || true)
+              REP=$(echo "$V" | grep -oE 'repaired=[A-Za-z]+' | cut -d= -f2 || true)
+              MISS=$(echo "$V" | grep -oE 'top_missing=[^ ]+' | cut -d= -f2 || true)
+              NEST=$(echo "$V" | grep -oE 'nested_ok=[A-Za-z]+' | cut -d= -f2 || true)
+              SLEN=$(echo "$V" | grep -oE 'summary_len=[0-9]+' | cut -d= -f2 || true)
+              REASON=$(echo "$V" | grep -oE 'reason=.*' | head -c 60 || true)
               echo "| \`$M\` | $r | \`200\` | $ELAPSED | $RLEN | $CLEN | ${VERDICT:-?} ${REASON} | ${REP:--} | ${MISS:--} | ${NEST:--} | ${SLEN:--} |" >> "$GITHUB_STEP_SUMMARY"
               sleep 8
             done
