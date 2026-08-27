@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import replace
 import os
 import tempfile
@@ -300,11 +301,18 @@ class PersistedIntelligenceAnalysisIntegrationTestCase(unittest.TestCase):
         ]
 
         merged = analyzer._merge_persisted_market_intelligence(search_news)
-        first_six = merged[:6]
-        local_count = len([item for item in first_six if str(item.get("title", "")).startswith("Market local headline")])
-        search_count = len([item for item in first_six if str(item.get("title", "")).startswith("Search headline")])
-        self.assertEqual(local_count, 3)
-        self.assertEqual(search_count, 3)
+        local_items = [
+            item for item in merged
+            if str(item.get("title", "")).startswith("Market local headline")
+        ]
+        search_items = [
+            item for item in merged
+            if str(item.get("title", "")).startswith("Search headline")
+        ]
+        # 配额按来源计算：5 个本地源各只有 1 条，均未触及上限故全部保留；
+        # 搜索结果整体视为一个来源，8 条截到 5 条，且不会被本地池挤掉。
+        self.assertEqual(len(local_items), 5)
+        self.assertEqual(len(search_items), MarketAnalyzer._MARKET_NEWS_PER_SOURCE_LIMIT)
 
         prompt = analyzer._build_review_prompt(
             MarketOverview(date="2026-06-17"),
@@ -329,8 +337,52 @@ class PersistedIntelligenceAnalysisIntegrationTestCase(unittest.TestCase):
             report="复盘正文",
             market_light_snapshot={"dimensions": {"breadth": {"available": True}}},
         )
-        self.assertGreaterEqual(len(payload["news"]), 8)
-        self.assertEqual(sum(item["title"].startswith("Search headline") for item in payload["news"][0:8]), 4)
+        # 条目总数远低于兜底总量上限，故结构化输出应完整带出、不发生截断
+        self.assertEqual(len(payload["news"]), len(merged))
+        self.assertLessEqual(len(merged), MarketAnalyzer._MARKET_NEWS_TOTAL_CAP)
+        self.assertEqual(
+            sum(item["title"].startswith("Search headline") for item in payload["news"]),
+            MarketAnalyzer._MARKET_NEWS_PER_SOURCE_LIMIT,
+        )
+
+    def test_market_review_caps_each_source_at_per_source_limit(self) -> None:
+        """单个高频源最多贡献 5 条，不再按更新频率挤占其他来源。
+
+        这是「每来源固定配额」替代「总槽位 + 轮转」的核心诉求：此前 Bloomberg
+        拆成 Markets/Economics/Technology 三个源，靠轮转拿到 3 倍权重，12 个槽位
+        里占掉 8 个；A 股侧则是同花顺与财联社各占 5 条把槽位占满。
+        """
+        repo = IntelligenceRepository()
+        now = datetime.now()
+        items = []
+        # 高频源 20 条，低频源 2 条，均在时效窗口内
+        for source_name, count in (("high-freq-feed", 20), ("low-freq-feed", 2)):
+            for index in range(count):
+                items.append({
+                    "source_name": source_name,
+                    "source_type": "rss",
+                    "title": f"{source_name} headline {index}",
+                    "summary": f"{source_name} summary {index}",
+                    "url": f"https://news.example.com/{source_name}/{index}",
+                    "source": source_name,
+                    "published_at": now + timedelta(minutes=index + 1),
+                    "fetched_at": now + timedelta(minutes=index + 1),
+                    "scope_type": "market",
+                    "scope_value": None,
+                    "market": "cn",
+                })
+        repo.upsert_items(items)
+
+        analyzer = MarketAnalyzer(config=self.config, region="cn")
+        merged = analyzer._merge_persisted_market_intelligence([])
+
+        limit = MarketAnalyzer._MARKET_NEWS_PER_SOURCE_LIMIT
+        counts = Counter(str(item.get("source") or "") for item in merged)
+        # 高频源被截到配额上限，低频源候选不足则全取，不会被前者挤掉
+        self.assertEqual(counts["high-freq-feed"], limit)
+        self.assertEqual(counts["low-freq-feed"], 2)
+        # 任何来源都不得超过配额
+        self.assertTrue(all(value <= limit for value in counts.values()), counts)
 
     def test_analysis_evidence_excludes_missing_or_stale_publish_time(self) -> None:
         self.config.news_max_age_days = 30
