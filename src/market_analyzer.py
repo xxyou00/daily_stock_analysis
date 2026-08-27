@@ -128,19 +128,20 @@ class MarketAnalyzer:
     5. 生成大盘复盘报告
     """
 
-    # 进入 prompt 的市场新闻条数上限，_build_review_prompt 直接引用本常量。
-    # 资讯池接入后可用条目从个位数涨到几百条（17 个源），窗口太窄会浪费素材，
-    # 因此从 6 提到 12。按每条 title 90 + snippet 220 估算约 3.7K 字符，
-    # 相对 16384 的 max_tokens 仍有充足余量。
-    _MARKET_NEWS_PROMPT_SLOTS = 12
-    # 上述槽位中预留给搜索结果的条数，其余优先给本地资讯池。
-    # 刻意不随总量翻倍：搜索结果没有发布时间、来源不可控，多给名额只是把
-    # 低质条目塞进上下文。总量翻倍后资讯池实际可用槽位从 4 涨到 10。
-    # 设 0 表示资讯池可以占满；搜索结果不足时该配额自动让给资讯池。
-    _MARKET_NEWS_SEARCH_RESERVED_SLOTS = 2
-    # 进入结构化输出（build_market_review_payload）的条数上限。
-    # 保持略大于 prompt 槽位，让下游消费方能看到 prompt 之外的备选条目。
-    _MARKET_NEWS_PAYLOAD_SLOTS = 16
+    # 每个来源进入 prompt 的固定条数。搜索结果整体视为一个来源。
+    #
+    # 取代原先「总槽位 12 + 给搜索预留 2 + 按来源轮转分配」的动态方案。原方案的
+    # 问题在于轮转只对单个 source 公平，而 Bloomberg 是 Markets / Economics /
+    # Technology 三个独立源，合起来自然拿到 3 倍权重：实测 12 个槽位里 Bloomberg
+    # 占掉 8 个，CNBC Economy 只剩 1 条；A 股侧同理，同花顺与财联社各占 5 条把
+    # 12 个槽位占满。改成按来源硬性配额后，各来源份额与它拆成几个源无关。
+    #
+    # 总量 = 有效来源数 x 5，随 region 变化（cn 侧约 3 个源、us 侧约 7 个源），
+    # 不再需要任何动态计算。
+    _MARKET_NEWS_PER_SOURCE_LIMIT = 5
+    # 兜底总量上限，仅防止来源数异常增长时 prompt 失控，正常不触发
+    # （有效来源数 x 5 远低于此值）。prompt 与结构化输出共用。
+    _MARKET_NEWS_TOTAL_CAP = 60
 
     def __init__(
         self,
@@ -827,7 +828,7 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             },
             "news": [
                 self._normalize_news_item(item)
-                for item in (news or [])[: self._MARKET_NEWS_PAYLOAD_SLOTS]
+                for item in (news or [])[: self._MARKET_NEWS_TOTAL_CAP]
             ],
             "sections": sections,
             "markdown_report": report,
@@ -1462,7 +1463,7 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         
         # 新闻信息 - 支持 SearchResult 对象或字典
         news_text = ""
-        for i, n in enumerate(news[: self._MARKET_NEWS_PROMPT_SLOTS], 1):
+        for i, n in enumerate(news[: self._MARKET_NEWS_TOTAL_CAP], 1):
             # 兼容 SearchResult 对象和字典
             title = self._compact_news_text(self._get_news_field(n, "title"), limit=90)
             snippet = self._compact_news_text(self._get_news_field(n, "snippet"), limit=220)
@@ -1862,22 +1863,26 @@ Market conditions can change quickly. The data above is for reference only and d
             structured_payload=structured_payload,
         )
 
-    @staticmethod
-    def _interleave_by_source(items: List[Dict]) -> List[Dict]:
-        """按来源轮转排列，避免高频源占满前排槽位。
+    @classmethod
+    def _take_per_source(cls, items: List[Dict], limit: Optional[int] = None) -> List[Dict]:
+        """每个来源最多取 limit 条，并按来源轮转排列。
 
-        资讯池按 published_at 倒序返回，而各源更新频率差着量级：金十快讯是
-        分钟级，Bloomberg / CNBC 是小时级，财联社电报还会连发同类公告。
-        纯时间排序的结果就是高频源把前排铺满，其他源即使有更相关的内容也进不来。
+        资讯池按 published_at 倒序返回，各源更新频率差着量级：金十快讯是分钟级，
+        Bloomberg / CNBC 是小时级，财联社电报还会连发同类公告。因此这里做两件事：
 
-        做法是按来源分组后轮流取一条。组内保持原有的时间倒序，组间顺序由各组
-        首条出现的先后决定（输入已是时间倒序，所以最新那条所属的源仍排最前），
-        因此"最新的一条"依然在第一位，只是后面不再被同一个源连续占据。
+        1. 配额：每个来源最多 limit 条，组内保持时间倒序（即该源最新的 limit 条）。
+           这样各来源份额固定，不受它更新多快、或它在配置里拆成几个源影响。
+        2. 轮转：输出时各来源轮流取一条，避免同一来源在 prompt 里连续占据一段。
+           组间顺序由各组首条出现的先后决定（输入已是时间倒序，最新那条所属的源
+           仍排最前），因此"最新的一条"依然在第一位。
         """
+        cap = cls._MARKET_NEWS_PER_SOURCE_LIMIT if limit is None else limit
         groups: Dict[str, List[Dict]] = {}
         for item in items:
             # dict 保持插入顺序，等价于按各组最新条目的时间先后排列
-            groups.setdefault(str(item.get("source") or ""), []).append(item)
+            bucket = groups.setdefault(str(item.get("source") or ""), [])
+            if len(bucket) < cap:
+                bucket.append(item)
         ordered: List[Dict] = []
         while groups:
             for name in list(groups.keys()):
@@ -1903,8 +1908,9 @@ Market conditions can change quickly. The data above is for reference only and d
                 market=self.region,
                 published_days=max(1, int(self.config.get_effective_news_window_days() or 1)),
                 page=1,
-                # 多取一些候选：与搜索结果去重后可能剩不足，且下面只会用前若干条。
-                page_size=self._MARKET_NEWS_PROMPT_SLOTS * 2,
+                # 多取候选：要保证每个来源都能凑满 5 条配额，且需覆盖与搜索结果
+                # 去重后的损耗，因此按「兜底总量上限 x 2」取。
+                page_size=self._MARKET_NEWS_TOTAL_CAP * 2,
             )
             for item in payload.get("items", []):
                 if not isinstance(item, dict):
@@ -1923,39 +1929,24 @@ Market conditions can change quickly. The data above is for reference only and d
         except Exception as exc:
             logger.debug("[大盘] %s action=load_local_intelligence status=failed error=%s", self._log_context(), exc)
 
-        # 资讯池内部按来源轮转，避免高频源（金十快讯分钟级更新）铺满前排。
-        merged_local = self._interleave_by_source(merged_local)
-
-        # 资讯池条目优先占位，搜索结果补剩余槽位。
-        #
-        # 原实现是严格交替（local, search, local, search...），在只取前 6 条的窗口下
-        # 等于把一半名额固定分给搜索结果。但两者质量差距明显：资讯池条目来自固定源
-        # （Bloomberg、CNBC、财联社、金十等），带真实发布时间和摘要；SearXNG 结果没有
-        # publishedDate，来源也不可控，实测混进过聚合站首页和配资广告页。
-        #
-        # 也不让资讯池占满：保留固定配额给搜索，避免某个源连发同类内容（例如财联社
-        # 电报的国债续发行公告）铺满整个窗口，丢掉其他视角。搜索结果不足时该配额
-        # 自动让给资讯池，反之亦然。
-        slots = self._MARKET_NEWS_PROMPT_SLOTS
-        reserved_for_search = min(self._MARKET_NEWS_SEARCH_RESERVED_SLOTS, len(search_news))
-        local_head = merged_local[: max(0, slots - reserved_for_search)]
-        search_head = search_news[: max(0, slots - len(local_head))]
-        merged_news = (
-            local_head
-            + search_head
-            + merged_local[len(local_head):]
-            + search_news[len(search_head):]
-        )
+        # 每个来源固定 5 条：资讯池按 source 分组配额，搜索结果整体算一个来源。
+        # 不再有「总槽位 - 搜索预留」这类动态分配，份额只由来源数决定。
+        local_total = len(merged_local)
+        merged_local = self._take_per_source(merged_local)
+        search_head = search_news[: self._MARKET_NEWS_PER_SOURCE_LIMIT]
+        merged_news = (merged_local + search_head)[: self._MARKET_NEWS_TOTAL_CAP]
         logger.info(
-            "[大盘] %s action=merge_market_news local=%d search=%d head_local=%d head_search=%d slots=%d head_sources=%s",
+            "[大盘] %s action=merge_market_news local_candidates=%d local_kept=%d "
+            "search_candidates=%d search_kept=%d per_source_limit=%d total=%d sources=%s",
             self._log_context(),
+            local_total,
             len(merged_local),
             len(search_news),
-            len(local_head),
             len(search_head),
-            slots,
-            # 前排各来源的占位数，用于直接核对轮转是否生效
-            dict(Counter(str(item.get("source") or "-") for item in local_head)),
+            self._MARKET_NEWS_PER_SOURCE_LIMIT,
+            len(merged_news),
+            # 各来源实际占位数，用于直接核对配额是否生效
+            dict(Counter(str(item.get("source") or "-") for item in merged_news)),
         )
         return merged_news
 
