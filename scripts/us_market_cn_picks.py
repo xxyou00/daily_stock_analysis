@@ -342,6 +342,7 @@ def _attach_prev_change(groups: List[Dict[str, Any]]) -> str:
     # 返回形如 var hq_str_sh600519="名称,今开,昨收,最新价,...,日期,时间";
     changes: Dict[str, str] = {}
     trade_date = ""
+    fallback_count = 0  # 无最新价、退化为展示昨收价的只数
     for line in raw.splitlines():
         match = re.search(r'hq_str_([a-z]{2}\d{6})="([^"]*)"', line)
         if not match:
@@ -352,16 +353,38 @@ def _attach_prev_change(groups: List[Dict[str, Any]]) -> str:
             continue
         try:
             # 字段顺序见 akshare_fetcher._get_stock_realtime_quote_sina：
-            # 2=昨收 3=最新价 30=日期
+            # 1=今开 2=昨收 3=最新价 30=日期
+            open_price = float(fields[1])
             pre_close = float(fields[2])
             price = float(fields[3])
         except (TypeError, ValueError):
             continue
-        if pre_close <= 0 or price <= 0:
+        if price > 0 and open_price > 0:
+            # 采用日内涨幅口径：(收盘 - 开盘) / 开盘，只反映盘中从开盘到收盘的
+            # 变化，不含隔夜跳空。注意这与交易所公布、行情软件显示的「涨跌幅」
+            # 不是一回事——后者是 (收盘 - 昨收) / 昨收，也是涨跌停判定的基准。
+            # 两者可能符号相反（跳空高开后回落时，标准口径为正、日内口径为负），
+            # 因此表头必须写明「日内涨幅」，不能简写成「涨幅」。
+            changes[code] = f"{(price - open_price) / open_price * 100:+.2f}%"
+            # 仅在真实算出涨幅时记录基准日：退化分支里 fields[30] 是当天日期，
+            # 而昨收对应的是上一交易日，拿它当基准日会标错。
+            if not trade_date:
+                trade_date = fields[30].strip()
+        elif pre_close > 0:
+            # 本脚本按 cron 在北京 05:30 前后运行，那时新浪 hq_str 仍是上一交易日
+            # 的收盘状态，fields[1]/fields[3] 即上一交易日的开盘与收盘价，能算出
+            # 该日的日内涨幅。但 schedule 延迟会把运行时刻推到 09:00 之后（实测
+            # 出现过 +210 与 +484 分钟），此时新浪已切换到当日、集合竞价尚未开始，
+            # 今开与最新价都返回 0，原实现整只跳过，12 只全部落空。
+            #
+            # 此处退化为展示 fields[2] 的昨收价（即最近一个交易日收盘价）。
+            # 刻意不拿昨收去套涨幅公式：用它同时充当开盘与收盘会得到恒为 +0.00%
+            # 的假涨幅，比留空更具误导性。表头写的是涨幅，所以值里必须自带
+            # 「昨收」标注，避免把价格误读成涨幅。
+            fallback_count += 1
+            changes[code] = f"{pre_close:.2f}（昨收）"
+        else:
             continue
-        changes[code] = f"{(price - pre_close) / pre_close * 100:+.2f}%"
-        if not trade_date:
-            trade_date = fields[30].strip()
 
     if not changes:
         logger.warning("[昨日涨幅] 新浪返回中没有可用行情，共请求 %s 只", len(symbol_to_code))
@@ -371,9 +394,22 @@ def _attach_prev_change(groups: List[Dict[str, Any]]) -> str:
         for pick in group["picks"]:
             pick["prev_change"] = changes.get(pick["code"], "")
 
-    logger.info(
-        "[昨日涨幅] 取到 %s/%s 只，基准交易日 %s", len(changes), len(codes), trade_date or "未知"
-    )
+    if fallback_count:
+        logger.warning(
+            "[昨日涨幅] 取到 %s/%s 只，其中 %s 只无最新价、退化为展示昨收价"
+            "（运行时刻已过当日 09:00、新浪切换到当日行情但未开盘），基准交易日 %s",
+            len(changes),
+            len(codes),
+            fallback_count,
+            trade_date or "未知",
+        )
+    else:
+        logger.info(
+            "[昨日涨幅] 取到 %s/%s 只，基准交易日 %s",
+            len(changes),
+            len(codes),
+            trade_date or "未知",
+        )
     return trade_date
 
 
@@ -410,7 +446,9 @@ def _render_report(
     lines.append(f"## 🇨🇳 关联 A 股推荐（{len(groups)} 个板块 / {total_picks} 只 · 仅看多）")
     lines.append("")
     if groups:
-        change_header = f"{trade_date} 涨幅" if trade_date else "上一交易日涨幅"
+        # 口径是 (收盘 - 开盘) / 开盘，与行情软件的「涨跌幅」（相对昨收）不同，
+        # 表头必须写明「日内」，否则读者会按标准涨跌幅理解。
+        change_header = f"{trade_date} 日内涨幅" if trade_date else "上一交易日日内涨幅"
         for group in groups:
             lines.append(f"### 📈 {group['sector']}")
             lines.append("")
