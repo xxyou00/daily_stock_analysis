@@ -1863,8 +1863,20 @@ Market conditions can change quickly. The data above is for reference only and d
             structured_payload=structured_payload,
         )
 
+    @staticmethod
+    def _news_source_of(item: Any) -> str:
+        """取新闻条目的来源名，兼容 dict 与 SearchResult。
+
+        资讯池条目是 dict，搜索结果是 dataclass SearchResult（有 .source 属性），
+        两者会混在同一个列表里往下传。此处必须同时支持，否则对合并后的列表做
+        统计会抛 AttributeError: 'SearchResult' object has no attribute 'get'。
+        """
+        if isinstance(item, dict):
+            return str(item.get("source") or "")
+        return str(getattr(item, "source", "") or "")
+
     @classmethod
-    def _take_per_source(cls, items: List[Dict], limit: Optional[int] = None) -> List[Dict]:
+    def _take_per_source(cls, items: List[Any], limit: Optional[int] = None) -> List[Any]:
         """每个来源最多取 limit 条，并按来源轮转排列。
 
         资讯池按 published_at 倒序返回，各源更新频率差着量级：金十快讯是分钟级，
@@ -1877,10 +1889,10 @@ Market conditions can change quickly. The data above is for reference only and d
            仍排最前），因此"最新的一条"依然在第一位。
         """
         cap = cls._MARKET_NEWS_PER_SOURCE_LIMIT if limit is None else limit
-        groups: Dict[str, List[Dict]] = {}
+        groups: Dict[str, List[Any]] = {}
         for item in items:
             # dict 保持插入顺序，等价于按各组最新条目的时间先后排列
-            bucket = groups.setdefault(str(item.get("source") or ""), [])
+            bucket = groups.setdefault(cls._news_source_of(item), [])
             if len(bucket) < cap:
                 bucket.append(item)
         ordered: List[Dict] = []
@@ -1945,8 +1957,9 @@ Market conditions can change quickly. The data above is for reference only and d
             len(search_head),
             self._MARKET_NEWS_PER_SOURCE_LIMIT,
             len(merged_news),
-            # 各来源实际占位数，用于直接核对配额是否生效
-            dict(Counter(str(item.get("source") or "-") for item in merged_news)),
+            # 各来源实际占位数，用于直接核对配额是否生效。
+            # 必须走 _news_source_of：merged_news 里混有 SearchResult 对象。
+            dict(Counter(self._news_source_of(item) or "-" for item in merged_news)),
         )
         return merged_news
 
