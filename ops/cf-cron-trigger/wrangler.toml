@@ -1,0 +1,22 @@
+name = "dsa-cron-trigger"
+main = "src/index.js"
+compatibility_date = "2026-08-01"
+
+# 不需要对外提供 HTTP 服务，只保留 Cron。仍会分配一个 workers.dev 域名，
+# 但 fetch 入口有 TRIGGER_KEY 校验，未配置该密钥时直接 403。
+workers_dev = true
+
+[triggers]
+# 一律 UTC。键值必须与 src/index.js 的 ROUTES 完全一致，否则会走到「未匹配路由」分支。
+#   43 8  * * 1-5  -> 北京 16:43 周一至周五：A 股日报
+#   30 21 * * 1-5  -> 北京次日 05:30 周二至周六：美股复盘 + A 股推荐
+crons = ["43 8 * * 1-5", "30 21 * * 1-5"]
+
+[vars]
+GH_REPO = "xxyou00/daily_stock_analysis"
+GH_REF = "main"
+
+# 以下为密钥，不写在此文件里，用 wrangler secret put 设置：
+#   GH_TOKEN           必需，GitHub PAT，需要该仓库的 Actions 写权限
+#   ALERT_WEBHOOK_URL  可选，触发失败时告警的飞书机器人 webhook
+#   TRIGGER_KEY        可选，配置后才允许 HTTP 手动触发
