@@ -26,10 +26,18 @@ const ROUTES = {
   // UTC 08:43 = 北京 16:43
   '43 8 * * *': {
     key: 'cn',
-    label: 'A 股日报',
+    label: 'A 股日报（仅大盘复盘）',
     workflow: '00-daily-analysis.yml',
-    // mode 在 workflow 里是 required；显式传值，不依赖 API 对 default 的处理
-    inputs: { mode: 'full' },
+    // mode 在 workflow 里是 required；显式传值，不依赖 API 对 default 的处理。
+    //
+    // 用 market-only 而非 full：自选股已清空（Repository variable 与
+    // Environment STOCK_LIST 下的同名变量都已删除），而 workflow 里有兜底
+    // `elif [ -z "${STOCK_LIST:-}" ]; then export STOCK_LIST="600519"`，
+    // 走 full 会变成分析贵州茅台——那不是任何人要的标的。market-only 只跑
+    // 大盘复盘、完全跳过个股分析，与「没有自选股」的语义一致。
+    //
+    // 恢复个股分析：重新配置 STOCK_LIST，并把这里改回 mode: 'full'。
+    inputs: { mode: 'market-only' },
   },
   // UTC 21:30 = 北京次日 05:30。该时刻同时晚于美股夏/冬令时收盘，又早于 A 股
   // 09:30 开盘。注意按 UTC 工作日过滤，即 UTC 周五 21:30 会触发（北京周六早上
