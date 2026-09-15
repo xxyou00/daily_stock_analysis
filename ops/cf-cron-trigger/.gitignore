@@ -1,0 +1,4 @@
+node_modules/
+# 本地 wrangler dev 用的明文密钥，绝不可提交
+.dev.vars
+.wrangler/
