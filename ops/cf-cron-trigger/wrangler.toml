@@ -7,10 +7,12 @@ compatibility_date = "2026-08-01"
 workers_dev = true
 
 [triggers]
-# 一律 UTC。键值必须与 src/index.js 的 ROUTES 完全一致，否则会走到「未匹配路由」分支。
-#   43 8  * * 1-5  -> 北京 16:43 周一至周五：A 股日报
-#   30 21 * * 1-5  -> 北京次日 05:30 周二至周六：美股复盘 + A 股推荐
-crons = ["43 8 * * 1-5", "30 21 * * 1-5"]
+# 一律 UTC，且刻意不写星期：Cloudflare 的 dow 解析有一位偏移（配 1-5 实测匹配
+# 周日至周四、周五不触发），工作日过滤改由 src/index.js 的 isUtcWeekday 处理。
+#   43 8  * * *  -> 北京 16:43，工作日执行：A 股日报
+#   30 21 * * *  -> 北京次日 05:30，UTC 工作日执行：美股复盘 + A 股推荐
+#                   （UTC 周五 21:30 会触发，对应北京周六早上推美股周五收盘复盘）
+crons = ["43 8 * * *", "30 21 * * *"]
 
 [vars]
 GH_REPO = "xxyou00/daily_stock_analysis"
