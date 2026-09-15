@@ -12,25 +12,79 @@
  * Cron 表达式一律 UTC。
  */
 
-/** cron 表达式 -> 目标 workflow。键必须与 wrangler.toml 的 crons 完全一致。 */
+/**
+ * cron 表达式 -> 目标 workflow。键必须与 wrangler.toml 的 crons 完全一致。
+ *
+ * 刻意不在 cron 里写星期（用 `* * *` 每天触发，工作日判断交给下面的
+ * isUtcWeekday）。原因是 Cloudflare 的 cron 解析器对 day-of-week 有一位偏移：
+ * 配 `1-5` 实测匹配到的是周日至周四，周五完全不触发（2026-09-04、09-11 的
+ * A 股日报因此漏跑，只靠延迟数小时的 GitHub schedule 兜住），而周日反而多跑
+ * （08-30、09-06、09-13）。社区已有同类报告：dow 写 5 被解析成周四。
+ * 把星期判断放进代码可以绕开该差异，也便于本地测试。
+ */
 const ROUTES = {
-  // UTC 08:43 = 北京 16:43（周一至周五）
-  '43 8 * * 1-5': {
+  // UTC 08:43 = 北京 16:43
+  '43 8 * * *': {
     key: 'cn',
     label: 'A 股日报',
     workflow: '00-daily-analysis.yml',
     // mode 在 workflow 里是 required；显式传值，不依赖 API 对 default 的处理
     inputs: { mode: 'full' },
   },
-  // UTC 21:30 = 北京次日 05:30（周二至周六）。该时刻同时晚于美股夏/冬令时收盘，
-  // 又早于 A 股 09:30 开盘。
-  '30 21 * * 1-5': {
+  // UTC 21:30 = 北京次日 05:30。该时刻同时晚于美股夏/冬令时收盘，又早于 A 股
+  // 09:30 开盘。注意按 UTC 工作日过滤，即 UTC 周五 21:30 会触发（北京周六早上
+  // 推送美股周五收盘的复盘），这与原 GitHub cron 的行为一致。
+  '30 21 * * *': {
     key: 'us',
     label: '美股复盘 + A 股推荐',
     workflow: '01-us-market-cn-picks.yml',
     inputs: { sectors: '4' },
   },
 };
+
+/** 按 UTC 判断是否工作日。0=周日、6=周六。 */
+function isUtcWeekday(date) {
+  const dow = date.getUTCDay();
+  return dow !== 0 && dow !== 6;
+}
+
+/**
+ * 幂等保护：查该 workflow 最近是否已有 workflow_dispatch 触发的 run。
+ *
+ * Cloudflare 的 cron 并非严格 exactly-once：2026-09-13 08:43:53Z 同一秒产生了
+ * 两个 run（34748404865 / 34748404972），等于当天推送了两遍。dispatch 本身不
+ * 幂等，重试或重复触发都会各起一个 run，因此在发起前先查一次。
+ */
+async function recentlyDispatched(route, env, windowMinutes = 15) {
+  const repo = requiredEnv(env, 'GH_REPO');
+  const token = requiredEnv(env, 'GH_TOKEN');
+  const url = `${GITHUB_API}/repos/${repo}/actions/workflows/${route.workflow}/runs`
+    + '?event=workflow_dispatch&per_page=5';
+  try {
+    const response = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        'User-Agent': 'dsa-cf-cron-trigger',
+      },
+    });
+    if (!response.ok) {
+      // 查不到就放行：宁可重复也不要漏触发，重复至少有报告可看
+      console.warn(`[idempotency] 查询最近 run 失败 status=${response.status}，跳过幂等检查`);
+      return null;
+    }
+    const data = await response.json();
+    const cutoff = Date.now() - windowMinutes * 60 * 1000;
+    const hit = (data.workflow_runs || []).find(
+      (run) => new Date(run.created_at).getTime() > cutoff,
+    );
+    return hit ? { id: hit.id, createdAt: hit.created_at } : null;
+  } catch (error) {
+    console.warn(`[idempotency] 查询最近 run 异常：${error}，跳过幂等检查`);
+    return null;
+  }
+}
 
 const GITHUB_API = 'https://api.github.com';
 const MAX_ATTEMPTS = 3;
@@ -118,9 +172,21 @@ async function alert(env, text) {
   }
 }
 
-async function runRoute(route, env, trigger) {
+async function runRoute(route, env, trigger, { checkIdempotency = false } = {}) {
   const startedAt = new Date().toISOString();
   console.log(`[run] trigger=${trigger} label=${route.label} at=${startedAt}`);
+
+  if (checkIdempotency) {
+    const existing = await recentlyDispatched(route, env);
+    if (existing) {
+      console.log(
+        `[run] 跳过：${route.workflow} 15 分钟内已有 dispatch run `
+        + `id=${existing.id} created=${existing.createdAt}`,
+      );
+      return { ok: true, skipped: true, existingRunId: existing.id };
+    }
+  }
+
   const result = await dispatchWorkflow(route, env);
   if (!result.ok) {
     await alert(
@@ -147,8 +213,19 @@ export default {
       await alert(env, `[DSA 定时触发异常] 收到未知 cron：${event.cron}`);
       return;
     }
-    // 用 waitUntil 保证异步收尾不被提前回收
-    ctx.waitUntil(runRoute(route, env, `cron:${event.cron}`));
+
+    // 工作日过滤放在代码里，不依赖 Cloudflare 的 dow 解析（见 ROUTES 上方说明）
+    const scheduledAt = new Date(event.scheduledTime);
+    if (!isUtcWeekday(scheduledAt)) {
+      console.log(
+        `[scheduled] 跳过：UTC 周末 dow=${scheduledAt.getUTCDay()} `
+        + `scheduledTime=${scheduledAt.toISOString()} label=${route.label}`,
+      );
+      return;
+    }
+
+    // 用 waitUntil 保证异步收尾不被提前回收；cron 路径开启幂等检查
+    ctx.waitUntil(runRoute(route, env, `cron:${event.cron}`, { checkIdempotency: true }));
   },
 
   /**
@@ -165,15 +242,26 @@ export default {
       return new Response('鉴权失败\n', { status: 401 });
     }
 
-    const target = new URL(request.url).searchParams.get('target');
-    const route = Object.values(ROUTES).find((item) => item.key === target);
-    if (!route) {
+    const url = new URL(request.url);
+    const target = url.searchParams.get('target');
+    const base = Object.values(ROUTES).find((item) => item.key === target);
+    if (!base) {
       const available = Object.values(ROUTES).map((item) => item.key).join(' | ');
-      return new Response(`用法：?target=${available}\n`, { status: 400 });
+      return new Response(`用法：?target=${available}[&<input>=<value>...]\n`, { status: 400 });
     }
 
+    // target 之外的 query 参数原样并入 inputs，便于验证时传 no_notify=true /
+    // dry_run=true 而不真的推送。值一律按字符串传，GitHub 对 boolean 型 input
+    // 也接受 "true"/"false"。
+    const overrides = {};
+    for (const [key, value] of url.searchParams) {
+      if (key !== 'target') overrides[key] = value;
+    }
+    const route = { ...base, inputs: { ...(base.inputs || {}), ...overrides } };
+
+    // HTTP 路径是人工操作，不做幂等拦截，避免「刚跑过就手动补一次」被误跳过
     const result = await runRoute(route, env, 'http');
-    return new Response(JSON.stringify({ label: route.label, ...result }, null, 2) + '\n', {
+    return new Response(JSON.stringify({ label: route.label, inputs: route.inputs, ...result }, null, 2) + '\n', {
       status: result.ok ? 200 : 502,
       headers: { 'Content-Type': 'application/json; charset=utf-8' },
     });
