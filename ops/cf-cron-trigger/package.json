@@ -1,0 +1,14 @@
+{
+  "name": "dsa-cron-trigger",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cloudflare Worker: 按准点用 workflow_dispatch 触发 GitHub Actions，绕开 schedule 排队",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev --test-scheduled",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}
