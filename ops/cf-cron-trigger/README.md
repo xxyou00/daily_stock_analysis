@@ -25,8 +25,31 @@ Cron 表达式一律 UTC，且必须与 `src/index.js` 的 `ROUTES` 键完全一
 
 | Cron (UTC) | 北京时间 | 目标 workflow |
 | --- | --- | --- |
-| `43 8 * * 1-5` | 16:43 周一至周五 | `00-daily-analysis.yml`（`mode=full`） |
-| `30 21 * * 1-5` | 次日 05:30 周二至周六 | `01-us-market-cn-picks.yml`（`sectors=4`） |
+| `43 8 * * *` | 16:43，工作日 | `00-daily-analysis.yml`（`mode=full`） |
+| `30 21 * * *` | 次日 05:30，UTC 工作日 | `01-us-market-cn-picks.yml`（`sectors=4`） |
+
+### 为什么 cron 里不写星期
+
+**Cloudflare 的 day-of-week 解析有一位偏移。** 最初配的是 `1-5`（本意周一至周五），实测结果：
+
+| UTC 星期 | 是否触发 |
+| --- | --- |
+| 周日 | 触发（08-30、09-06、09-13） |
+| 周一至周四 | 触发 |
+| **周五** | **不触发**（09-04、09-11 的 A 股日报因此漏跑） |
+| 周六 | 不触发 |
+
+即 `1-5` 实际匹配周日至周四。社区有同类报告：dow 写 `5` 被解析成周四（[Durable Objects cron parsing is broken](https://community.cloudflare.com/t/durable-objects-cron-parsing-is-broken/946704)）。
+
+因此改为每天触发，工作日过滤交给代码里的 `isUtcWeekday()`。这样不依赖平台的 dow 语义，且可本地验证。**不要**把星期改回 cron 表达式。
+
+### 幂等保护
+
+Cloudflare 的 cron 不是严格 exactly-once：2026-09-13 08:43:53Z 同一秒产生了两个 run（`34748404865` / `34748404972`），当天推送了两遍。而 `workflow_dispatch` 本身不幂等，重复触发或重试都会各起一个 run。
+
+因此 cron 路径在发起前会查该 workflow 最近 15 分钟内是否已有 `workflow_dispatch` run，有则跳过并记日志。查询失败时放行（宁可重复也不漏触发）。
+
+HTTP 路径**不做**幂等拦截，避免「刚跑过又想手动补一次」被误跳过。
 
 ## 部署
 
