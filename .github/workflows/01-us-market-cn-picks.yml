@@ -4,11 +4,18 @@ name: 美股复盘与A股关联推荐
 # 区域通过脚本内的 override_region="us" 传入，不依赖也不修改 MARKET_REVIEW_REGION，
 # 因此不会影响 17:18 的 A 股任务。
 on:
-  schedule:
-    # UTC 21:30 = 北京时间次日 05:30。
-    # 美股收盘为 EDT 夏令时 20:00 UTC / EST 冬令时 21:00 UTC，21:30 可覆盖两种时制；
-    # 同时早于 A 股 09:30 开盘，推荐结果当天可用。非整点亦为避开 Actions 排队高峰。
-    - cron: '30 21 * * 1-5'
+  # ⚠️ 定时触发已移交 Cloudflare Worker（见 ops/cf-cron-trigger/）。
+  # GitHub schedule 排队严重：实测 2026-08 延迟 +32 ~ +631 分钟、从未准时，
+  # 08-28 UTC 08:43 那次更是被直接丢弃、完全没有触发。而且它与 Worker 并存时
+  # 会因 cancel-in-progress=false 排队后照常执行，导致每个工作日推送两轮
+  # （08-31 ~ 09-15 期间每天 2 次）。Worker 走 workflow_dispatch API 直接触发，
+  # 实测 created->started 为 0 秒。
+  # 回滚办法：取消下面 schedule 段的注释即可恢复原状。
+  # schedule:
+  #   # UTC 21:30 = 北京时间次日 05:30。
+  #   # 美股收盘为 EDT 夏令时 20:00 UTC / EST 冬令时 21:00 UTC，21:30 可覆盖两种时制；
+  #   # 同时早于 A 股 09:30 开盘，推荐结果当天可用。非整点亦为避开 Actions 排队高峰。
+  #   - cron: '30 21 * * 1-5'
   workflow_dispatch:
     inputs:
       sectors:
